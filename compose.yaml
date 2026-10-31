@@ -1,0 +1,142 @@
+name: nemotron-transcribe-local
+
+x-app: &app
+  image: nemotron-transcribe-app:local
+  build: ./app
+
+services:
+  init-data:
+    <<: *app
+    user: '0:0'
+    command:
+      - python
+      - -c
+      - |
+        import os
+        from pathlib import Path
+        uid, gid = int(os.environ['APP_UID']), int(os.environ['APP_GID'])
+        for name in ('/models', '/data', '/data/uploads', '/data/results', '/data/tmp'):
+            path = Path(name)
+            path.mkdir(parents=True, exist_ok=True)
+            os.chown(path, uid, gid)
+    environment:
+      APP_UID: ${HOST_UID:-1000}
+      APP_GID: ${HOST_GID:-1000}
+    volumes:
+      - ./data:/data
+      - ./models:/models
+    restart: 'no'
+
+  # Invoking `docker compose up` explicitly provisions the pinned weights.
+  # Complete local files are verified without a network request on later starts.
+  model-download:
+    build:
+      context: .
+      dockerfile: runtime/download.Dockerfile
+    user: '${HOST_UID:-1000}:${HOST_GID:-1000}'
+    environment:
+      MODELS_DIR: /models
+      HF_HOME: /models/.hf-cache
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ./models:/models
+    depends_on:
+      init-data:
+        condition: service_completed_successfully
+    restart: 'no'
+
+  # CPU baseline is independently runnable; CUDA is an explicit override.
+  nemo:
+    image: nemotron-transcribe-cpu:local
+    build:
+      context: .
+      dockerfile: runtime/Dockerfile
+      target: runtime
+      args:
+        ENABLE_CUDA: 'OFF'
+        ENABLE_CUDA_GRAPHS: 'OFF'
+        ENABLE_GRPC: 'OFF'
+        ENABLE_FLASHLIGHT: 'OFF'
+        ENABLE_NORM: 'OFF'
+        ENABLE_HTTP: 'ON'
+        ENABLE_SPEECHLM: 'ON'
+        ENABLE_S2S: 'OFF'
+        ENABLE_NMT: 'OFF'
+        CUDA_ARCH: '86'
+        JOBS: '${BUILD_JOBS:-8}'
+    command: ['serve', '--config', '/runtime/cpu.yaml', '--asr.backend.threads', '${NEMO_CPU_THREADS:-12}', '--host', '0.0.0.0', '--port', '8080', '--read-timeout', '3600', '--write-timeout', '3600', '--no-ui']
+    volumes:
+      - ./models:/models:ro
+      - ./runtime:/runtime:ro
+    depends_on:
+      model-download:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    stop_grace_period: 1m
+
+  web:
+    <<: *app
+    user: '${HOST_UID:-1000}:${HOST_GID:-1000}'
+    command: ['uvicorn', 'main:app', '--host', '0.0.0.0', '--port', '7860', '--workers', '1']
+    ports:
+      - '127.0.0.1:${WEB_PORT:-7860}:7860'
+    environment:
+      DATA_DIR: /data
+      NEMO_URL: http://nemo:8080
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-2048}
+      MAX_DURATION_SECONDS: ${MAX_DURATION_SECONDS:-14400}
+      MIN_FREE_DISK_MB: ${MIN_FREE_DISK_MB:-1024}
+      MAX_PENDING_JOBS: ${MAX_PENDING_JOBS:-100}
+      RETENTION_DAYS: ${RETENTION_DAYS:-0}
+      NEMO_MODE: cpu
+      RUNTIME_LOCK_FILE: /runtime-lock.json
+    volumes:
+      - ./data:/data
+      - ./runtime.lock.json:/runtime-lock.json:ro
+    depends_on:
+      init-data:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    init: true
+    healthcheck:
+      test: ['CMD', 'python', '-c', 'import httpx; httpx.get("http://127.0.0.1:7860/api/jobs", timeout=3).raise_for_status()']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  worker:
+    <<: *app
+    user: '${HOST_UID:-1000}:${HOST_GID:-1000}'
+    command: ['python', 'worker.py']
+    environment:
+      DATA_DIR: /data
+      NEMO_URL: http://nemo:8080
+      POLL_SECONDS: '3'
+      MAX_DURATION_SECONDS: ${MAX_DURATION_SECONDS:-14400}
+      MIN_FREE_DISK_MB: ${MIN_FREE_DISK_MB:-1024}
+      RETENTION_DAYS: ${RETENTION_DAYS:-0}
+      NEMO_MODE: cpu
+    volumes:
+      - ./data:/data
+    depends_on:
+      nemo:
+        condition: service_started
+    restart: unless-stopped
+    init: true
+
+  monitor:
+    <<: *app
+    user: '${HOST_UID:-1000}:${HOST_GID:-1000}'
+    command: ['python', 'monitor.py']
+    pid: service:nemo
+    environment:
+      DATA_DIR: /data
+      NEMO_MODE: cpu
+    volumes:
+      - ./data:/data
+    depends_on:
+      nemo:
+        condition: service_started
+        restart: true
+    restart: unless-stopped

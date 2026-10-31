@@ -1,0 +1,74 @@
+# EXPERIMENTAL TEMPLATE — NOT RUNNABLE WITHOUT A PATCHED NeMo-Speech.cpp CUDA IMAGE.
+# Do not claim GPU+CPU offload is available in stock NVIDIA NeMo-Speech.cpp.
+# Build/verify a compatible runtime with a recognized asr.salm.n_cpu_moe flag first.
+# Example invocation (only after patch validation):
+#   NEMO_HYBRID_IMAGE=my-reviewed-nemo-speech-hybrid:sha docker compose \
+#      -f compose.hybrid.example.yaml up -d
+name: nemotron-transcribe-hybrid-experimental
+services:
+  nemo:
+    image: ${NEMO_HYBRID_IMAGE:?Set NEMO_HYBRID_IMAGE to your reviewed, working patched runtime image}
+    gpus: all
+    environment:
+      NEMO_SALM_LOAD_MODE: mmap
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - ./models:/models:ro
+    command:
+      - serve
+      - --host
+      - 0.0.0.0
+      - --port
+      - '8080'
+      - --asr-model
+      - /models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-AD-IQ4_NL.gguf
+      - --asr.salm.n_cpu_moe
+      - '${NEMO_CPU_MOE_LAYERS:-40}'
+      - --asr.salm.max_sequences
+      - '1'
+      - --asr.salm.n_ctx_per_sequence
+      - '16384'
+      - --asr.salm.max_context
+      - '16384'
+      - --asr.salm.mtp_draft
+      - '0'
+      - --asr.salm.n_batch
+      - '512'
+      - --asr.salm.encoder_max_batch
+      - '1'
+      - --read-timeout
+      - '3600'
+      - --write-timeout
+      - '3600'
+      - --no-ui
+    restart: unless-stopped
+    stop_grace_period: 1m
+  web:
+    build: ./app
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    command: ['uvicorn','main:app','--host','0.0.0.0','--port','7860','--workers','1']
+    environment:
+      DATA_DIR: /data
+      NEMO_URL: http://nemo:8080
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-2048}
+    volumes:
+      - ./data:/data
+    ports:
+      - '127.0.0.1:${WEB_PORT:-7860}:7860'
+    depends_on: [nemo]
+    restart: unless-stopped
+    init: true
+  worker:
+    build: ./app
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    command: ['python','worker.py']
+    environment:
+      DATA_DIR: /data
+      NEMO_URL: http://nemo:8080
+      POLL_SECONDS: '3'
+    volumes:
+      - ./data:/data
+    depends_on: [nemo]
+    restart: unless-stopped
+    init: true

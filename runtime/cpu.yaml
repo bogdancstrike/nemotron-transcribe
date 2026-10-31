@@ -1,0 +1,15 @@
+asr:
+  model:
+    path: /models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-AD-IQ4_NL.gguf
+    name: salm
+  backend:
+    gpu: -1
+  salm:
+    encoder_path: /models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-Encoder-F16.gguf
+    max_sequences: 1
+    n_ctx_per_sequence: 16384
+    max_context: 16384
+    mtp_draft: 0
+    max_new_tokens: 4096
+    n_batch: 512
+    encoder_max_batch: 1

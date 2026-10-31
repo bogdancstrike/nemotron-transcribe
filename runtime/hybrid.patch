@@ -1,0 +1,127 @@
+diff --git a/app/serve.cpp b/app/serve.cpp
+index ecdc3d1..a30daf8 100644
+--- a/app/serve.cpp
++++ b/app/serve.cpp
+@@ -769,6 +769,7 @@ print_serve_help(const char* program) {
+         "  --asr-model MODEL       ASR GGUF path or indexed model\n"
+         "  --salm-encoder FILE     SALM encoder GGUF instead of the one the decoder names\n"
+         "  --asr.salm.* VALUE      SALM scheduling; complete-audio requests only\n"
++        "  --asr.salm.n_cpu_moe N  CPU routed experts in first N blocks (local hybrid patch)\n"
+         "  --vad-model MODEL       Optional VAD model\n"
+         "  --pnc-model MODEL       Optional punctuation model\n"
+         "  --itn-model-dir MODEL   Optional ITN grammar directory\n"
+diff --git a/src/asr/recognizer.h b/src/asr/recognizer.h
+index 12ce79a..6ba92aa 100644
+--- a/src/asr/recognizer.h
++++ b/src/asr/recognizer.h
+@@ -45,6 +45,8 @@ struct SalmBackendConfig {
+     // setting.
+     std::string ctc_path;
+     // Defaults sized for a 32 GB GPU; raise max_sequences and the batch sizes on larger ones.
++    // First N decoder block indices: only routed MoE FFN weights stay on CPU.
++    int n_cpu_moe = 0;
+     int max_sequences = 16;
+     int n_ctx_per_sequence = 8192;
+     int max_context = 73728;
+@@ -59,6 +61,7 @@ struct SalmBackendConfig {
+             "encoder_path", &encoder_path,
+             "SALM encoder GGUF (selects SALM; default: the encoder file the decoder names)",
+             {"--salm-encoder"});
++        p.Register("n_cpu_moe", &n_cpu_moe, "CPU routed-expert weights in first N decoder blocks (hybrid, mmap)");
+         p.Register("max_sequences", &max_sequences, "SALM concurrent decode slots");
+         p.Register(
+             "n_ctx_per_sequence", &n_ctx_per_sequence,
+diff --git a/src/speechlm/salm_engine.cpp b/src/speechlm/salm_engine.cpp
+index 70679df..62fd2e7 100644
+--- a/src/speechlm/salm_engine.cpp
++++ b/src/speechlm/salm_engine.cpp
+@@ -180,7 +180,7 @@ constexpr size_t kEncoderAhead = 256;
+ 
+ struct SalmEngine::Impl {
+     SalmConfig cfg;
+-    llama_model_tensor_buft_override embedding_overrides[2] = {};
++    std::vector<llama_model_tensor_buft_override> tensor_overrides;
+     ggml_backend_dev_t decoder_devices[2] = {};  // the decoder's GPU (null-terminated list)
+     ggml_runtime::BackendManager bm;
+     // Batched serving path (SALM_FAST_PATH builds on a CUDA GPU with a Nemotron-H MoE decoder):
+@@ -367,7 +367,9 @@ struct SalmEngine::Impl {
+         : cfg(std::move(c)), bm(make_params(cfg)), pee(bm, cfg.encoder_path, false, cfg.ctc_path) {
+ #if SALM_FAST_PATH
+         // the serving kernels need an NVIDIA GPU of compute capability 8.0 or newer
+-        fast = cfg.gpu >= 0 && bm.gpu_backend_handle() != nullptr &&
++        // Mixed CPU experts use the upstream ggml scheduler, including Mamba state.
++        // The fused serving kernels assume all routed experts reside on CUDA.
++        fast = cfg.n_cpu_moe == 0 && cfg.gpu >= 0 && bm.gpu_backend_handle() != nullptr &&
+                ggml_backend_is_cuda(bm.gpu_backend_handle()) &&
+                ggml_backend_cuda_serving_supported(bm.gpu_backend_handle());
+ #endif
+@@ -425,7 +427,7 @@ struct SalmEngine::Impl {
+         mp.n_gpu_layers = cfg.gpu >= 0 ? 999 : 0;
+         mp.load_mtp = cfg.mtp_draft > 0 && cfg.dflash_path.empty();
+         if (cfg.gpu >= 0) {
+-            mp.load_mode = LLAMA_LOAD_MODE_NONE;
++            mp.load_mode = cfg.n_cpu_moe > 0 ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
+             // The requested GPU alone: by default llama.cpp splits the layers over every GPU.
+             for (size_t i = 0, gpu_index = 0; i < ggml_backend_dev_count(); ++i) {
+                 auto dev = ggml_backend_dev_get(i);
+@@ -443,13 +445,25 @@ struct SalmEngine::Impl {
+         if (fast) {  // token embeddings on the GPU (mixed text/audio rows are looked up there)
+             if (!decoder_devices[0])
+                 throw std::runtime_error("embedding GPU device not found");
+-            embedding_overrides[0] = {
+-                "token_embd\\.weight", ggml_backend_dev_buffer_type(decoder_devices[0])};
+-            mp.tensor_buft_overrides = embedding_overrides;
++            tensor_overrides.push_back({
++                "token_embd\\.weight", ggml_backend_dev_buffer_type(decoder_devices[0])});
++        }
++        if (cfg.n_cpu_moe > 0) {
++            // Same routed-expert regex and CPU buffer as llama.cpp --n-cpu-moe.
++            // Shared experts, router, attention and Mamba tensors keep GPU placement.
++            llm_add_n_cpu_ffn_overrides(cfg.n_cpu_moe, LLM_FFN_EXPS_REGEX, tensor_overrides);
++            std::fprintf(stderr, "[salm] hybrid CPU routed experts: first %d decoder blocks; "
++                                 "load_mode=mmap; upstream scheduler; MTP disabled\n", cfg.n_cpu_moe);
++        }
++        if (!tensor_overrides.empty()) {
++            tensor_overrides.push_back({nullptr, nullptr});
++            mp.tensor_buft_overrides = tensor_overrides.data();
+         }
+         model = llama_model_load_from_file(cfg.llm_path.c_str(), mp);
+         if (!model)
+             throw std::runtime_error("failed to load LLM " + cfg.llm_path);
++        if (cfg.n_cpu_moe > llama_model_n_layer(model))
++            throw std::invalid_argument("asr.salm.n_cpu_moe exceeds decoder block count");
+         vocab = llama_model_get_vocab(model);
+         if (const auto t = tokenize(vocab, kTurnEnd); t.size() == 1)
+             im_end = t[0];
+diff --git a/src/speechlm/salm_engine.h b/src/speechlm/salm_engine.h
+index f5053e9..ddaf74c 100644
+--- a/src/speechlm/salm_engine.h
++++ b/src/speechlm/salm_engine.h
+@@ -34,6 +34,7 @@ struct SalmConfig {
+     std::string ctc_path;  // CTC timestamp head GGUF (the encoder file); empty: no word timestamps
+     std::string llm_path;  // llama.cpp GGUF of the decoder
+     int gpu = 0;           // GPU device index for encoder and decoder, -1 = CPU only
++    int n_cpu_moe = 0;      // Routed MoE FFN tensors in first N decoder block indices, not N MoE layers.
+     int threads = 8;       // CPU threads for host-side decoder work
+     // User turn; must contain exactly one audio locator.
+     std::string prompt =
+diff --git a/src/speechlm/salm_recognizer.cpp b/src/speechlm/salm_recognizer.cpp
+index 77bf828..89048e9 100644
+--- a/src/speechlm/salm_recognizer.cpp
++++ b/src/speechlm/salm_recognizer.cpp
+@@ -53,6 +53,7 @@ engine_config(const asr::RecognizerConfig& c) {
+     constexpr int kMaxMtpDraft = 15;
+     if (s.max_sequences < 1 || s.n_ctx_per_sequence < 1 || s.max_context < 1 || s.n_batch < 1 ||
+         s.encoder_max_batch < 1 || s.encoder_ahead_seconds < 0 || s.max_new_tokens < 1 ||
++        s.n_cpu_moe < 0 || s.n_cpu_moe > 10000 || (s.n_cpu_moe > 0 && c.backend.gpu < 0) ||
+         s.mtp_draft < 0 || s.mtp_draft > kMaxMtpDraft)
+         throw std::invalid_argument("invalid SALM scheduling configuration");
+     SalmConfig out;
+@@ -60,6 +61,7 @@ engine_config(const asr::RecognizerConfig& c) {
+     out.ctc_path = s.ctc_path;
+     out.llm_path = c.model.path;
+     out.gpu = c.backend.gpu;
++    out.n_cpu_moe = s.n_cpu_moe;
+     // host-side decoder work: asr.backend.threads, as for the other models (0 = min(8, hardware
+     // threads))
+     const unsigned hw = std::thread::hardware_concurrency();

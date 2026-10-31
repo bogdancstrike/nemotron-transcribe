@@ -1,0 +1,16 @@
+.env
+__pycache__/
+.pytest_cache/
+*.pyc
+models/*
+!models/.gitkeep
+data/*
+!data/.gitkeep
+vendor/*
+!vendor/.gitkeep
+evidence/*
+!evidence/.gitkeep
+
+.venv/
+
+.idea/

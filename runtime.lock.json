@@ -1,0 +1,21 @@
+{
+  "upstream_repo": "https://github.com/NVIDIA/NeMo-Speech.cpp.git",
+  "upstream_commit": "20999cc921d2b14aa58708f61756a8b2e787ba20",
+  "llama_commit": "bd4f514db14d87fded667787a7a963bfbaa98e89",
+  "model_repo": "AtomicChat/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-GGUF",
+  "model_revision": "dbd06c5cad7a2f33c8e06be2fb3ef814dbd9aa59",
+  "files": [
+    {
+      "filename": "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-AD-IQ4_NL.gguf",
+      "size": 19678656672,
+      "sha256": "0c47d4ab6c783e7606ec03714b354fab0b2052027a7ea1991e7e2d3009c345ad"
+    },
+    {
+      "filename": "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-Encoder-F16.gguf",
+      "size": 1670410080,
+      "sha256": "4221029c8a565c4a80c507ffa760c716e595acf663f9f4273ce69910050e7ba2"
+    }
+  ],
+  "hybrid_patch_commit": "0f3c7f087aec9b1e496d2b4d784ad76a7cd2f2e0",
+  "hybrid_patch_sha256": "049bdd72b828a66e5c5287c79508b2c2e3a976da97f0c9d0c24af15b75598ff2"
+}
