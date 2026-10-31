@@ -42,7 +42,9 @@ def main():
                             token=os.getenv('HF_TOKEN') or None)
     verified = [verify(args.models_dir / f['filename'], f) for f in lock['files']]
     manifest = {**lock, 'files': verified}
-    (args.models_dir / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    temporary = args.models_dir / 'manifest.json.tmp'
+    temporary.write_text(json.dumps(manifest, indent=2) + '\n')
+    temporary.replace(args.models_dir / 'manifest.json')
     print(json.dumps(manifest, indent=2))
 
 

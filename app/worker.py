@@ -1,5 +1,9 @@
 """One host worker, one reusable model server; bounded PCM requests and honest timing."""
 import fcntl
+import difflib
+import base64
+import re
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import math
@@ -17,6 +21,7 @@ import httpx
 
 import db
 from db import DATA, claim_job, init_db, recover_jobs, update_job
+from settings import CAPACITY, LANGUAGES
 from media import probe_audio
 
 LOG = logging.getLogger('worker')
@@ -62,6 +67,24 @@ def valid_alignment(segment):
         previous = start
     # Refuse partial alignment as well as invalid timings. Preserve the raw response in JSON.
     return normalized_letters(' '.join(w['word'] for w in words)) == normalized_letters(text)
+
+
+def playback_words(segment):
+    """Map exact transcript tokens to genuine model words; unmatched text stays untimed."""
+    text = segment.get('text','')
+    tokens = list(re.finditer(r"[^\W_]+(?:['’\-][^\W_]+)*", text, re.UNICODE))
+    words = [word for word in segment.get('words',[]) if isinstance(word,dict) and
+             isinstance(word.get('word'),str) and all(isinstance(word.get(k),(int,float)) and not isinstance(word[k],bool) and math.isfinite(word[k]) for k in ('start','end')) and
+             0 <= word['start'] < word['end'] <= segment.get('duration_s',float('inf')) + .1]
+    source = [normalized_letters(token.group()) for token in tokens]
+    timed = [normalized_letters(word['word']) for word in words]
+    result = []
+    for block in difflib.SequenceMatcher(a=source,b=timed,autojunk=False).get_matching_blocks():
+        for n in range(block.size):
+            token, word = tokens[block.a+n], words[block.b+n]
+            result.append({'word':token.group(), 'char_start':len(text[:token.start()].encode('utf-16-le'))//2, 'char_end':len(text[:token.end()].encode('utf-16-le'))//2,
+                           'start':word['start'],'end':word['end'], **({'speaker':word['speaker']} if 'speaker' in word else {})})
+    return result
 
 
 def srt_from_segments(segments: list) -> str:
@@ -114,22 +137,44 @@ def pcm_duration(path):
         return stream.getnframes() / stream.getframerate()
 
 
-def transcribe_chunk(path: Path, lang: str, diarize: bool) -> dict:
+def transcribe_chunk(path: Path, lang: str, diarize: bool, output_language="source", number_style="natural") -> dict:
     timeout = httpx.Timeout(connect=15, read=float(os.getenv('INFERENCE_TIMEOUT_SECONDS', '3600')), write=180, pool=15)
     payload = {'response_format': 'verbose_json'}
     if lang != 'auto':
         payload['language'] = lang
-    if diarize:
+    translation = output_language not in {'source', lang}
+    if translation:
+        payload['target_language'] = output_language
+    elif diarize:
         payload['diarization'] = 'true'
+    custom = not translation and (diarize or number_style == 'digits')
+    instruction = 'Transcribe the audio faithfully in its original language, with punctuation and capitalization. Preserve names, quantities, units and the exact numeric values. Do not translate, summarize, or add information.'
+    if lang != 'auto':
+        instruction += f' The speech is in {LANGUAGES.get(lang,lang)}.'
+    if number_style == 'digits' or diarize:
+        instruction += ' Write numeric quantities in conventional numeric form rather than spelling separator punctuation. For example, Romanian "zece mii de lei" is "10 000 lei". Preserve actual decimal values and units.'
+    if diarize:
+        instruction += ' Include all spoken words and verbal fillers. Put speaker tags <spk:0> <spk:1> <spk:2> <spk:3> <spk:4> <spk:5> <spk:6> <spk:7> on the transcription, one consistent tag for each speaker.'
+    chat = {'model':'salm','messages':[{'role':'user','content':[
+        {'type':'text','text':instruction},
+        {'type':'input_audio','input_audio':{'data':base64.b64encode(path.read_bytes()).decode('ascii'),'format':'wav'}}]}],
+        'timestamp_granularities':['word']} if custom else None
     for attempt in range(3):
         try:
             with path.open('rb') as stream, httpx.Client(timeout=timeout) as client:
-                response = client.post(NEMO + '/v1/audio/transcriptions', data=payload,
-                                       files={'file': (path.name, stream, 'audio/wav')})
+                if custom:
+                    response = client.post(NEMO + '/v1/chat/completions', json=chat)
+                else:
+                    response = client.post(NEMO + ('/v1/audio/translations' if translation else '/v1/audio/transcriptions'), data=payload,
+                                           files={'file': (path.name, stream, 'audio/wav')})
             if response.is_error and any(term in response.text.lower() for term in ('out of memory', 'out-of-memory', 'cuda_error_out_of_memory', 'oom')):
                 raise RuntimeError('Model ran out of memory. Reduce runtime context/batch or switch to CPU, then restart the engine.')
             response.raise_for_status()
             result = response.json()
+            if custom:
+                raw = result
+                result = raw.get('transcription', {})
+                if isinstance(result,dict):result = {**result, '_raw_chat_response':raw}
             if not isinstance(result, dict) or not isinstance(result.get('text'), str):
                 raise RuntimeError('Unexpected model response: expected a JSON object with text')
             return result
@@ -191,12 +236,16 @@ def do_job(job: dict):
         source = Path(job['input_path']).stat()
         signature = {'size':source.st_size, 'mtime_ns':source.st_mtime_ns,
                      'language':job['language'], 'diarize':bool(job['diarize']),
-                     'segment_seconds':job['segment_seconds'], 'backend':os.getenv('NEMO_MODE','cpu'),
+                     'segment_seconds':job['segment_seconds'], 'output_language':job.get('output_language','source'), 'number_style':job.get('number_style','natural'), 'backend':os.getenv('NEMO_MODE','cpu'),
                      'patch_commit':os.getenv('NEMO_PATCH_COMMIT','')}
+        if job.get('number_style','natural') != 'natural' or job['diarize']:
+            signature['transcription_policy'] = 'readable-numbers-v1'
+            signature['number_style'] = job.get('number_style','natural')
         checkpoint = outdir / 'checkpoint.json'
         prior_wall = 0.0
         try:
             saved = json.loads(checkpoint.read_text())
+            saved['signature'].setdefault('output_language', 'source')
             if saved['signature'] == signature and isinstance(saved['segments'], list) and len(saved['segments']) <= len(chunks):
                 candidate = saved['segments']
                 offset = 0.0
@@ -217,9 +266,10 @@ def do_job(job: dict):
                 continue
             duration = pcm_duration(path)
             segment_started = time.perf_counter()
+            interval_started = db.now()
             for recovery in range(3):
                 try:
-                    result = transcribe_chunk(path, job['language'], bool(job['diarize']))
+                    result = transcribe_chunk(path, job['language'], bool(job['diarize']), job.get('output_language','source'), job.get('number_style','natural'))
                     break
                 except BackendDisconnected as exc:
                     # Retry only after a real engine outage; an interrupted live engine may
@@ -231,6 +281,7 @@ def do_job(job: dict):
                     update_job(id, error=None)
             else:
                 raise RuntimeError('Model disconnected repeatedly')
+            db.record_interval(id, interval_started, db.now())
             wall = time.perf_counter() - segment_started
             inference_s += wall
             segment = {'index': n, 'start_seconds': cumulative_offset, 'duration_s': duration,
@@ -238,6 +289,7 @@ def do_job(job: dict):
                        'text': result['text'], 'words': result.get('words') or [],
                        'language': result.get('language'), 'raw_response': result}
             segment['alignment_valid'] = valid_alignment(segment)
+            segment['playback_words'] = playback_words(segment)
             segments.append(segment)
             cumulative_offset += duration
             elapsed = prior_wall + time.perf_counter() - started
@@ -252,6 +304,7 @@ def do_job(job: dict):
         wall_s = prior_wall + time.perf_counter() - started
         metadata = {'job_id': id, 'original_filename': job['filename'], 'language_hint': job['language'],
                     'diarization_requested': bool(job['diarize']), 'speaker_scope': 'chunk',
+                    'output_language':job.get('output_language','source'), 'number_style':job.get('number_style','natural'),
                     'timestamp_source': 'model_word_alignment' if srt else 'unavailable',
                     'srt_available': bool(srt), 'duration_s': cumulative_offset, 'wall_s': wall_s,
                     'inference_s': inference_s, 'rtfx': cumulative_offset / wall_s,
@@ -300,20 +353,27 @@ def main():
         # Remove crash leftovers only while holding the exclusive host lock.
         shutil.rmtree(DATA / 'tmp', ignore_errors=True)
         last_prune = 0
-        while True:
-            if time.monotonic() - last_prune >= 3600:
-                prune_expired()
-                last_prune = time.monotonic()
-            wait_for_model()
-            job = claim_job()
-            if not job:
-                time.sleep(float(os.getenv('POLL_SECONDS', '3')))
-                continue
-            try:
-                do_job(job)
-            except Exception as exc:
-                LOG.exception('Job failed: %s', job['id'])
-                update_job(job['id'], status='failed', error=str(exc)[-1800:])
+        with ThreadPoolExecutor(max_workers=CAPACITY, thread_name_prefix='file') as pool:
+            futures = {}
+            while True:
+                for future in list(futures):
+                    if future.done():
+                        job = futures.pop(future)
+                        try:
+                            future.result()
+                        except Exception as exc:
+                            LOG.exception('Job failed: %s', job['id'])
+                            update_job(job['id'], status='failed', error=str(exc)[-1800:])
+                if time.monotonic() - last_prune >= 3600:
+                    prune_expired()
+                    last_prune = time.monotonic()
+                parallel = db.get_settings()['parallel_jobs']
+                if len(futures) < parallel and model_ready():
+                    job = claim_job(parallel)
+                    if job:
+                        futures[pool.submit(do_job, job)] = job
+                        continue
+                time.sleep(.5 if futures else float(os.getenv('POLL_SECONDS','3')))
 
 
 if __name__ == '__main__':

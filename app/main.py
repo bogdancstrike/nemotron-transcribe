@@ -10,12 +10,13 @@ from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 import db
 from db import DATA, create_job, get_job, init_db, list_jobs
 from media import probe_audio
+from settings import LANGUAGES, CAPACITY
 
 INPUT = DATA / 'uploads'
 OUTPUT = DATA / 'results'
@@ -86,7 +87,15 @@ async def local_requests(request: Request, call_next):
 
 @app.get('/')
 def index():
+    return RedirectResponse('/upload')
+
+
+def page():
     return FileResponse(STATIC / 'index.html')
+
+
+for _page in ('upload','files','player','statistics','info','settings','corrections'):
+    app.add_api_route('/'+_page, page, methods=['GET'], include_in_schema=False)
 
 
 @app.get('/api/system')
@@ -117,19 +126,32 @@ async def system():
             'max_upload_mb': MAX_UPLOAD // (1024 * 1024),
             'disk_free_gib': round(usage.free / 1024**3, 2),
             'retention_days': int(os.getenv('RETENTION_DAYS', '0')),
-            'telemetry': telemetry, 'runtime': runtime}
+            'telemetry': telemetry, 'runtime': runtime, 'settings':db.get_settings(), 'engine_capacity':CAPACITY, 'accepted_filetypes':sorted(EXTS)}
 
 
 @app.post('/api/jobs', status_code=201)
-async def upload(file: UploadFile = File(...), language: str = Form('ro'), segment_seconds: int = Form(120), diarize: bool = Form(False)):
+async def upload(file: UploadFile = File(...), language: str | None = Form(None), segment_seconds: int | None = Form(None), diarize: bool | None = Form(None), output_language: str | None = Form(None), number_style: str | None = Form(None)):
+    defaults = db.get_settings()
+    number_style = number_style if number_style is not None else defaults['number_style']
+    language = language if language is not None else defaults['input_language']
+    output_language = output_language if output_language is not None else defaults['output_language']
+    segment_seconds = segment_seconds if segment_seconds is not None else defaults['segment_seconds']
+    diarize = diarize if diarize is not None else defaults['diarize']
     original = Path((file.filename or '').replace('\\', '/')).name[:180]
     ext = Path(original).suffix.lower()
     try:
+        if number_style not in {'natural','digits'}:
+            raise HTTPException(400,'Number formatting must be natural or digits')
         if ext not in EXTS:
             raise HTTPException(400, 'Unsupported extension. Upload audio or video only.')
         language = language.lower().strip()
-        if language not in {'ro', 'en', 'auto'}:
-            raise HTTPException(400, 'Supported language options: ro, en, auto')
+        if language not in {*LANGUAGES, 'auto'}:
+            raise HTTPException(400, 'Unsupported input language')
+        output_language = output_language.lower().strip()
+        if output_language not in {*LANGUAGES, 'source'}:
+            raise HTTPException(400, 'Unsupported output language')
+        if diarize and output_language not in {'source', language}:
+            raise HTTPException(400, 'Speaker detection requires original-language output')
         if segment_seconds not in {60, 120, 300}:
             raise HTTPException(400, 'Segment size must be 60, 120 or 300 seconds')
         id = uuid.uuid4().hex
@@ -151,7 +173,7 @@ async def upload(file: UploadFile = File(...), language: str = Form('ro'), segme
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
             try:
-                await asyncio.to_thread(create_job, id, original, str(dest), language, segment_seconds, diarize, duration)
+                await asyncio.to_thread(create_job, id, original, str(dest), language, segment_seconds, diarize, duration, output_language, number_style)
             except ValueError as exc:
                 raise HTTPException(429, str(exc)) from exc
             return {'id': id, 'status': 'queued'}
@@ -166,13 +188,13 @@ async def upload(file: UploadFile = File(...), language: str = Form('ro'), segme
 
 
 @app.get('/api/jobs')
-def jobs():
-    return {'jobs': list_jobs()}
+def jobs(all: bool = False):
+    return {'jobs': list_jobs(limit=None if all else 100)}
 
 
 @app.get('/api/stats')
 def stats():
-    return db.statistics()
+    return {**db.statistics(), **db.model_throughput()}
 
 
 @app.get('/api/jobs/{id}')
@@ -208,6 +230,14 @@ def download(id: str, format: str):
     path = OUTPUT / item['id'] / f'transcript.{format}'
     if not path.is_file():
         raise HTTPException(404, 'Result not found')
+    if format == 'json':
+        # Backfill playback mappings for older exports without changing the stored model timings.
+        from worker import playback_words
+        data = json.loads(path.read_text())
+        for segment in data.get('segments', []):
+            if 'playback_words' not in segment:
+                segment['playback_words'] = playback_words(segment)
+        return JSONResponse(data, headers={'Content-Disposition':FileResponse(path, filename=f'{Path(item["filename"]).stem[:90]}.json').headers['content-disposition']})
     return FileResponse(path, media_type='application/octet-stream', filename=f'{Path(item["filename"]).stem[:90]}.{format}')
 
 
@@ -237,3 +267,63 @@ def retry(id: str):
     if row is None:
         raise HTTPException(404, 'Job not found')
     return {'id':id, 'status':'queued'}
+
+
+@app.get('/api/settings')
+def settings():
+    return {'settings':db.get_settings(), 'languages':LANGUAGES, 'engine_capacity':CAPACITY,
+            'active_jobs':sum(j['status'] in {'preparing','processing'} for j in db.list_jobs())}
+
+
+@app.put('/api/settings')
+def update_settings(values: dict):
+    try:
+        return {'settings':db.save_settings(values), 'engine_capacity':CAPACITY}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def completed_for_correction(id):
+    job = get_job(id)
+    if not job or job['status'] != 'done':
+        raise HTTPException(409 if job else 404, 'A completed recording is required')
+    return job
+
+
+@app.get('/api/jobs/{id}/correction')
+def correction(id: str):
+    job = completed_for_correction(id)
+    saved = db.get_correction(id)
+    if saved:
+        return {**saved,'filename':job['filename']}
+    path = OUTPUT / id / 'transcript.txt'
+    if not path.is_file():
+        raise HTTPException(404, 'Transcript not available')
+    return {'job_id':id,'text':path.read_text(encoding='utf-8'),'revision':0,'updated_at':None,'filename':job['filename']}
+
+
+@app.put('/api/jobs/{id}/correction')
+def update_correction(id: str, values: dict):
+    completed_for_correction(id)
+    text, revision = values.get('text'), values.get('revision')
+    if not isinstance(text,str) or len(text)>2_000_000 or isinstance(revision,bool) or not isinstance(revision,int) or revision<0:
+        raise HTTPException(400, 'A transcript of at most 2 million characters and a valid revision are required')
+    try:
+        return db.save_correction(id,text,revision)
+    except ValueError as exc:
+        raise HTTPException(409,str(exc)) from exc
+
+
+@app.get('/api/jobs/{id}/correction/download/{format}')
+def export_correction(id: str, format: str):
+    job = completed_for_correction(id)
+    value = correction(id)
+    if format not in {'txt','json'}:
+        raise HTTPException(404, 'Corrected text is available as TXT or JSON; original word timing does not apply to edited words')
+    filename = f'{Path(job["filename"]).stem[:80]}-corrected.{format}'
+    headers = {'Content-Disposition':FileResponse('unused',filename=filename).headers['content-disposition']}
+    if format=='txt':
+        return Response(value['text'],media_type='text/plain',headers=headers)
+    return JSONResponse({'job_id':id,'original_filename':job['filename'],'text':value['text'],
+                         'revision':value['revision'],'updated_at':value['updated_at'],
+                         'timing_source':None,'note':'Analyst-edited text; original alignment is not attached to changed words.'},headers=headers)

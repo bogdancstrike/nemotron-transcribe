@@ -25,8 +25,9 @@
           aria-controls="uploadTab"
           data-tab="upload"
         >
-          Upload</button
-        ><button
+          Upload
+        </button>
+        <button
           role="tab"
           id="filesNav"
           aria-selected="false"
@@ -34,8 +35,9 @@
           aria-controls="filesTab"
           data-tab="files"
         >
-          Files</button
-        ><button
+          Files
+        </button>
+        <button
           role="tab"
           id="playerNav"
           aria-selected="false"
@@ -43,8 +45,9 @@
           data-tab="player"
           tabindex="-1"
         >
-          Player</button
-        ><button
+          Player
+        </button>
+        <button
           role="tab"
           id="statsNav"
           aria-selected="false"
@@ -52,8 +55,19 @@
           data-tab="stats"
           tabindex="-1"
         >
-          Statistics</button
-        ><button
+          Statistics
+        </button>
+        <button
+          role="tab"
+          id="correctionsNav"
+          aria-selected="false"
+          aria-controls="correctionsTab"
+          data-tab="corrections"
+          tabindex="-1"
+        >
+          Corrections
+        </button>
+        <button
           role="tab"
           id="infoNav"
           aria-selected="false"
@@ -62,6 +76,16 @@
           tabindex="-1"
         >
           Info
+        </button>
+        <button
+          role="tab"
+          id="settingsNav"
+          aria-selected="false"
+          aria-controls="settingsTab"
+          data-tab="settings"
+          tabindex="-1"
+        >
+          Settings
         </button>
       </nav>
       <p
@@ -124,10 +148,16 @@
               <summary>Transcription settings</summary>
               <div class="field-grid">
                 <label for="language"
-                  >Language<select id="language">
+                  >Input language<select id="language">
                     <option value="ro">Romanian</option>
                     <option value="en">English</option>
                     <option value="auto">Auto-detect</option>
+                  </select></label
+                ><label for="outputLanguage"
+                  >Output language<select id="outputLanguage">
+                    <option value="source">Same as spoken</option>
+                    <option value="ro">Romanian</option>
+                    <option value="en">English</option>
                   </select></label
                 ><label for="duration"
                   >Segment length<select id="duration">
@@ -171,14 +201,34 @@
         <section class="recordings" aria-label="Transcription queue">
           <div class="section-cap">
             <h2>Files <span id="queueCount" class="count">0</span></h2>
-            <label class="search-label"
-              ><span class="visually-hidden">Search recordings</span
-              ><input
-                id="search"
-                type="search"
-                placeholder="Search files"
-                autocomplete="off"
-            /></label>
+          </div>
+          <div class="files-toolbar">
+            <div class="status-views" aria-label="Filter file status">
+              <button
+                data-file-status="all"
+                class="selected"
+                aria-pressed="true"
+              >
+                All <span></span></button
+              ><button data-file-status="queued" aria-pressed="false">
+                Queued <span></span></button
+              ><button data-file-status="processing" aria-pressed="false">
+                Transcribing <span></span></button
+              ><button data-file-status="done" aria-pressed="false">
+                Completed <span></span></button
+              ><button data-file-status="failed" aria-pressed="false">
+                Failed <span></span>
+              </button>
+            </div>
+            <label class="sort-label"
+              ><span class="visually-hidden">Sort files</span
+              ><select id="fileSort">
+                <option value="newest">Newest first</option>
+                <option value="oldest">Oldest first</option>
+                <option value="status">Status</option>
+                <option value="name">Name</option>
+              </select></label
+            >
           </div>
           <div class="queue-summary" id="queueSummary" hidden>
             <span id="activeSummary">Waiting for recordings</span
@@ -190,6 +240,11 @@
               <p>Add a recording to get started.</p>
             </div>
           </div>
+          <div
+            id="filePagination"
+            class="pagination"
+            aria-label="Files pagination"
+          ></div>
           <p class="queue-footer" id="retention">
             Files stay here until you delete them.
           </p>
@@ -241,6 +296,24 @@
               ><span id="playbackTime">0:00 / 0:00</span>
             </div>
             <p id="mediaError" class="feedback error" role="status"></p>
+            <div class="sync-tools">
+              <label
+                >Sync offset
+                <input
+                  id="syncOffset"
+                  type="number"
+                  min="-10"
+                  max="10"
+                  step="0.1"
+                  value="0"
+                />
+                s</label
+              ><button id="jumpFirstWord" class="secondary">
+                First aligned word
+              </button>
+            </div>
+            <p id="syncStatus" class="player-tip" role="status"></p>
+            <div id="speakerLegend" class="speaker-legend"></div>
             <p class="player-tip">
               Click a word in the transcript to jump to that point.
             </p>
@@ -251,7 +324,14 @@
           </div>
           <div class="transcript-column">
             <div class="transcript-toolbar">
-              <h2>Transcript</h2>
+              <div class="transcript-view-controls">
+                <select id="transcriptView" aria-label="Transcript view">
+                  <option value="full">Full transcript</option>
+                  <option value="speakers">By speaker</option></select
+                ><select id="speakerFilter" aria-label="Filter speaker" hidden>
+                  <option value="all">All speakers</option>
+                </select>
+              </div>
               <label class="follow-control"
                 ><input id="followPlayback" type="checkbox" checked /> Follow
                 playback</label
@@ -304,6 +384,7 @@
             </div>
           </div>
         </section>
+        <p id="combinedThroughput" class="combined-throughput"></p>
         <section class="stats-detail">
           <h2>Per file</h2>
           <div class="table-scroll">
@@ -321,6 +402,11 @@
               <tbody id="fileStatistics"></tbody>
             </table>
           </div>
+          <div
+            id="statsPagination"
+            class="pagination"
+            aria-label="Statistics pagination"
+          ></div>
         </section>
         <details class="measurement-note">
           <summary>How these numbers work</summary>
@@ -370,6 +456,164 @@
           includes resident mapped pages and runtime allocations. RAM figures
           come from the host kernel.
         </p>
+      </section>
+      <section
+        id="settingsTab"
+        class="tab-panel"
+        role="tabpanel"
+        aria-labelledby="settingsNav"
+        hidden
+      >
+        <div class="page-heading">
+          <h1>Make it yours.</h1>
+          <p>Defaults for new uploads and the local processing queue.</p>
+        </div>
+        <form id="settingsForm" class="settings-page">
+          <section class="settings-card">
+            <h2>Processing</h2>
+            <div class="setting-row">
+              <label for="parallelLevel"
+                >Parallel files<small
+                  >All files share one loaded model. Lower values leave more
+                  memory headroom.</small
+                ></label
+              ><select id="parallelLevel">
+                <option>1</option>
+                <option>2</option>
+                <option>4</option>
+                <option>8</option>
+                <option>16</option>
+                <option value="custom">Custom</option>
+              </select>
+            </div>
+            <div class="setting-row" id="customParallelRow" hidden>
+              <label for="customParallel">Custom level</label
+              ><input
+                id="customParallel"
+                type="number"
+                min="1"
+                max="16"
+                value="3"
+              />
+            </div>
+            <p id="parallelCapacity" class="quiet"></p>
+            <div class="setting-row">
+              <label for="defaultChunk"
+                >Segment length<small
+                  >Shorter segments give more frequent progress updates.</small
+                ></label
+              ><select id="defaultChunk">
+                <option value="60">60 seconds</option>
+                <option value="120">120 seconds</option>
+                <option value="300">300 seconds</option>
+              </select>
+            </div>
+          </section>
+          <section class="settings-card">
+            <h2>Languages and speakers</h2>
+            <div class="setting-row">
+              <label for="defaultInputLanguage"
+                >Input language<small
+                  >Auto-detect lets the model choose the spoken language.</small
+                ></label
+              ><select id="defaultInputLanguage"></select>
+            </div>
+            <div class="setting-row">
+              <label for="defaultOutputLanguage"
+                >Output language<small
+                  >Keep the spoken language, or translate into the selected
+                  language.</small
+                ></label
+              ><select id="defaultOutputLanguage"></select>
+            </div>
+            <label class="checkbox-row"
+              ><input id="defaultDiarize" type="checkbox" /><span
+                >Identify speakers<small
+                  >Speaker IDs are local to each segment. Translations may not
+                  provide word timing or speaker labels.</small
+                ></span
+              ></label
+            >
+          </section>
+          <div class="settings-save">
+            <span id="settingsMessage" role="status"></span
+            ><button class="primary" type="submit">Save settings</button>
+          </div>
+        </form>
+      </section>
+      <section
+        id="correctionsTab"
+        class="tab-panel"
+        role="tabpanel"
+        aria-labelledby="correctionsNav"
+        hidden
+      >
+        <div class="player-heading">
+          <div>
+            <h1>Listen. Refine. Export.</h1>
+            <p class="quiet">
+              Correct the transcript while listening to the original recording.
+            </p>
+          </div>
+          <label class="correction-picker"
+            ><span class="visually-hidden">Choose a recording to correct</span
+            ><select id="correctionFile">
+              <option value="">Choose a recording</option>
+            </select></label
+          >
+        </div>
+        <div id="correctionEmpty" class="player-empty">
+          <p>Choose a completed recording to start reviewing.</p>
+        </div>
+        <div id="correctionWorkspace" class="correction-layout" hidden>
+          <div class="correction-media">
+            <h2 id="correctionTitle"></h2>
+            <div id="correctionMediaMount"></div>
+            <div class="review-controls">
+              <button id="rewindCorrection" class="secondary">
+                ↶ 5 seconds</button
+              ><button id="toggleCorrection" class="secondary">
+                Play / pause</button
+              ><label
+                >Speed<select id="correctionSpeed">
+                  <option value="0.75">0.75×</option>
+                  <option value="1" selected>1×</option>
+                  <option value="1.25">1.25×</option>
+                  <option value="1.5">1.5×</option>
+                </select></label
+              >
+            </div>
+            <p class="quiet">
+              Alt + Space to play or pause. Ctrl / ⌘ + S to save.
+            </p>
+            <p class="quiet correction-note">
+              Your reviewed text is saved separately. The model transcript and
+              its word timing stay unchanged.
+            </p>
+          </div>
+          <div class="correction-editor">
+            <div class="correction-toolbar">
+              <label for="correctionText">Reviewed transcript</label
+              ><span id="correctionStatus" role="status">Loading…</span>
+            </div>
+            <textarea
+              id="correctionText"
+              spellcheck="true"
+              placeholder="The transcript will appear here."
+            ></textarea>
+            <div class="correction-bottom">
+              <span id="correctionCount"></span>
+              <div>
+                <button id="saveCorrection" class="secondary">Save</button
+                ><button id="exportCorrection" class="primary compact">
+                  Export TXT</button
+                ><button id="exportCorrectionJson" class="secondary">
+                  JSON
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
       </section>
       <footer>
         <span id="backendLabel">CPU · RAM</span

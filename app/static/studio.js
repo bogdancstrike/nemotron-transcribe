@@ -1,4 +1,16 @@
 "use strict";
+let routeVersion = 0;
+const corrections = {
+  jobId: null,
+  filename: "",
+  revision: 0,
+  savedText: "",
+  timer: null,
+  pending: null,
+  media: null,
+  conflict: false,
+  request: 0,
+};
 const $ = (selector) => document.querySelector(selector);
 const ui = {
   chosen: [],
@@ -144,6 +156,7 @@ $("#submit").addEventListener("click", async () => {
     failed = [],
     settings = {
       language: $("#language").value,
+      output_language: $("#outputLanguage").value,
       segment_seconds: $("#duration").value,
       diarize: String($("#diarize").checked),
     };
@@ -177,6 +190,11 @@ $("#submit").addEventListener("click", async () => {
   await refresh();
   if (uploadedId) {
     switchTab("files");
+    history.replaceState(
+      {},
+      "",
+      `/files?job=${encodeURIComponent(uploadedId)}`,
+    );
     const card = document.querySelector(`[data-job-id="${uploadedId}"]`);
     if (card) {
       card.classList.add("recent-upload");
@@ -202,35 +220,77 @@ function elapsed(job) {
   return job.wall_s;
 }
 function renderJobs() {
-  const holder = $("#jobs"),
-    query = $("#search").value.trim().toLocaleLowerCase(),
-    jobs = ui.jobs.filter(
-      (j) =>
-        (ui.filter === "all" ||
-          (ui.filter === "active" ? active(j) : j.status === ui.filter)) &&
-        j.filename.toLocaleLowerCase().includes(query),
-    );
+  if (document.querySelector(".job-menu[open]")) return false;
+  let holder = $("#jobs"),
+    query = "",
+    status = ui.fileStatus || "all",
+    order = $("#fileSort").value;
+  let jobs = ui.jobs.filter(
+    (j) =>
+      j.filename.toLocaleLowerCase().includes(query) &&
+      (status === "all" ||
+        (status === "processing"
+          ? ["preparing", "processing"].includes(j.status)
+          : j.status === status)),
+  );
+  const ranks = { queued: 0, preparing: 1, processing: 1, done: 2, failed: 3 };
+  jobs.sort((a, b) =>
+    order === "oldest"
+      ? a.created_at.localeCompare(b.created_at)
+      : order === "name"
+        ? a.filename.localeCompare(b.filename)
+        : order === "status"
+          ? ranks[a.status] - ranks[b.status] ||
+            b.created_at.localeCompare(a.created_at)
+          : b.created_at.localeCompare(a.created_at),
+  );
   $("#queueCount").textContent = ui.jobs.length;
+  for (const button of document.querySelectorAll("[data-file-status]")) {
+    const selected = button.dataset.fileStatus === status;
+    button.classList.toggle("selected", selected);
+    button.setAttribute("aria-pressed", String(selected));
+    const count = ui.jobs.filter(
+      (j) =>
+        button.dataset.fileStatus === "all" ||
+        (button.dataset.fileStatus === "processing"
+          ? ["preparing", "processing"].includes(j.status)
+          : j.status === button.dataset.fileStatus),
+    ).length;
+    button.querySelector("span").textContent = count;
+  }
+  const allCount = jobs.length;
+  const pageSize = ui.filePageSize || 10;
+  ui.filePage = Math.max(
+    1,
+    Math.min(ui.filePage || 1, Math.ceil(allCount / pageSize) || 1),
+  );
+  paginateControl(
+    "#filePagination",
+    allCount,
+    ui.filePage,
+    pageSize,
+    (page, size) => {
+      ui.filePage = page;
+      ui.filePageSize = size;
+      renderJobs();
+    },
+  );
+  jobs = jobs.slice((ui.filePage - 1) * pageSize, ui.filePage * pageSize);
   holder.replaceChildren();
   if (!jobs.length) {
     const empty = node("div", "empty-state");
-    const wave = node("div", "empty-wave");
-    wave.setAttribute("aria-hidden", "true");
-    for (let i = 0; i < 9; i++) wave.append(node("i"));
     empty.append(
-      wave,
       node("h3", "", ui.jobs.length ? "No matching files" : "No files yet"),
       node(
         "p",
         "",
         ui.jobs.length
-          ? "Try another filter or search."
-          : "Add an M4A or MP4 recording to get started.",
+          ? "Try another status or search."
+          : "Add a recording in Upload to get started.",
       ),
-      node("span", "empty-label", "READY WHEN YOU ARE"),
     );
     holder.append(empty);
-    return;
+    return true;
   }
   for (const job of jobs) {
     const card = node("article", `job ${job.status}`);
@@ -241,48 +301,101 @@ function renderJobs() {
         "file-icon",
         job.filename.split(".").pop().toUpperCase().slice(0, 5),
       ),
-      nameWrap = node("div", "job-name-wrap"),
-      subtitle = node("div", "job-subtitle");
-    subtitle.append(
-      node("span", "", duration(job.duration_s)),
-      node(
-        "span",
-        "",
-        job.language === "auto" ? "AUTO" : job.language.toUpperCase(),
-      ),
-      node(
-        "span",
-        "",
-        new Date(job.created_at).toLocaleString(undefined, {
-          month: "short",
-          day: "numeric",
-          hour: "2-digit",
-          minute: "2-digit",
-        }),
-      ),
-    );
-    nameWrap.append(node("h3", "job-name", job.filename), subtitle);
+      main = node("div", "job-name-wrap");
+    main.append(node("h3", "job-name", job.filename));
+    const hint =
+      job.output_language && job.output_language !== "source"
+        ? `${job.language.toUpperCase()} → ${job.output_language.toUpperCase()}`
+        : job.language === "auto"
+          ? "Auto language"
+          : job.language.toUpperCase();
+    const metadata = [`${duration(job.duration_s)} audio`, hint];
+    if (job.status === "done")
+      metadata.push(`${duration(job.wall_s)} processing`, speed(job.rtfx));
+    else if (["processing", "preparing"].includes(job.status))
+      metadata.push("Processing now");
+    main.append(node("p", "job-subtitle", metadata.join(" · ")));
     head.append(
       icon,
-      nameWrap,
+      main,
       node(
         "span",
         `status ${job.status}`,
         {
-          done: "Completed",
+          queued: "Queued",
           preparing: "Preparing",
           processing: "Transcribing",
-          queued: "Queued",
+          done: "Completed",
           failed: "Failed",
-        }[job.status] || job.status,
+        }[job.status],
       ),
     );
+    if (job.status === "done") {
+      const open = node("button", "secondary preview-button", "Open player");
+      open.addEventListener("click", () => showPlayer(job));
+      head.append(open);
+    }
+    const menu = node("details", "job-menu"),
+      summary = node("summary", "", "⋯");
+    summary.setAttribute("aria-label", `Actions for ${job.filename}`);
+    menu.append(summary);
+    const items = node("div", "job-menu-items");
+    function action(label, callback, danger = false) {
+      const button = node("button", danger ? "menu-danger" : "", label);
+      button.type = "button";
+      button.addEventListener("click", () => {
+        menu.open = false;
+        callback();
+      });
+      items.append(button);
+    }
+    if (job.status === "done") {
+      action("Correct transcript", () => showCorrections(job.id));
+      for (const format of job.srt_available
+        ? ["txt", "json", "srt"]
+        : ["txt", "json"]) {
+        const link = node("a", "", `Download ${format.toUpperCase()}`);
+        link.href = endpoint(job.id, format);
+        link.addEventListener("click", () => {
+          menu.open = false;
+        });
+        items.append(link);
+      }
+    }
+    if (["done", "failed"].includes(job.status))
+      action("Retry", async () => {
+        try {
+          await api(`/api/jobs/${encodeURIComponent(job.id)}/retry`, {
+            method: "POST",
+          });
+          feedback("Recording queued for another run.");
+          await refresh();
+        } catch (error) {
+          feedback(error.message, true);
+        }
+      });
+    if (!["processing", "preparing"].includes(job.status))
+      action(
+        "Delete",
+        () => {
+          ui.deleting = job;
+          $("#deleteFilename").textContent = job.filename;
+          $("#deleteDialog").showModal();
+        },
+        true,
+      );
+    else items.append(node("span", "menu-hint", "Processing is active"));
+    menu.append(items);
+    menu.addEventListener("toggle", () => {
+      if (!menu.open && menu.isConnected) renderJobs();
+    });
+    head.append(menu);
     card.append(head);
     if (active(job)) {
-      const box = node("div", "job-progress"),
+      const progress = node("div", "job-progress"),
         bar = node("progress");
       bar.max = 100;
-      bar.value = Math.max(0, Math.min(100, job.progress));
+      bar.value = job.progress;
       bar.setAttribute("aria-label", `${job.filename} transcription progress`);
       const label = node("div", "job-progress-label");
       label.append(
@@ -290,22 +403,23 @@ function renderJobs() {
           "span",
           "",
           job.status === "queued"
-            ? "Waiting for the engine / previous file"
+            ? "Waiting for an available slot"
             : job.status === "preparing"
-              ? "Preparing audio for the model"
-              : `${job.completed_segments} of ${job.total_segments} segments complete`,
+              ? "Preparing the recording"
+              : `${job.completed_segments} of ${job.total_segments} segments`,
         ),
         node("strong", "", `${job.progress}%`),
       );
-      box.append(bar, label);
-      card.append(box);
+      progress.append(bar, label);
+      card.append(progress);
     }
+    if (job.error) card.append(node("p", "job-error", job.error));
     if (job.status !== "queued") {
-      const stats = node("div", "job-stats");
+      const details = node("details", "job-details"),
+        title = node("summary", "", "Details"),
+        stats = node("div", "job-stats");
       const timeStat = stat(
-        ["processing", "preparing"].includes(job.status)
-          ? "Elapsed"
-          : "Processing time",
+        active(job) ? "Elapsed" : "Processing time",
         duration(elapsed(job)),
       );
       if (active(job)) timeStat.querySelector("b").dataset.elapsedId = job.id;
@@ -319,70 +433,29 @@ function renderJobs() {
         stat("Real-time factor", job.rtfx ? factor(1 / job.rtfx) : "—"),
         stat("Inference time", duration(job.inference_s)),
       );
-      card.append(stats);
-    }
-    if (job.error) card.append(node("p", "job-error", job.error));
-    const actions = node("div", "job-actions"),
-      links = node("div", "download-links");
-    if (job.status === "done") {
-      const preview = node("button", "secondary preview-button", "Open player");
-      preview.addEventListener("click", () => showPlayer(job));
-      links.append(preview);
-      for (const format of job.srt_available
-        ? ["txt", "json", "srt"]
-        : ["txt", "json"]) {
-        const link = node("a", "download-link", `${format.toUpperCase()} ↓`);
-        link.href = endpoint(job.id, format);
-        link.setAttribute(
-          "aria-label",
-          `Download ${format.toUpperCase()} for ${job.filename}`,
+      details.append(title, stats);
+      if (job.status === "done" && !job.srt_available)
+        details.append(
+          node(
+            "p",
+            "srt-note",
+            "Full subtitle alignment is unavailable. Any matching timed words remain accessible in Player.",
+          ),
         );
-        links.append(link);
-      }
-    }
-    actions.append(links);
-    if (["failed", "done"].includes(job.status)) {
-      const retry = node("button", "secondary", "Retry");
-      retry.addEventListener("click", async () => {
-        retry.disabled = true;
-        try {
-          await api(`/api/jobs/${encodeURIComponent(job.id)}/retry`, {
-            method: "POST",
-          });
-          feedback(
-            "Recording queued. Completed segments will resume when compatible.",
-          );
-          await refresh();
-        } catch (e) {
-          feedback(e.message, true);
-          retry.disabled = false;
-        }
+      details.open = !!ui.expandedFiles?.has(job.id);
+      details.addEventListener("toggle", () => {
+        ui.expandedFiles ??= new Set();
+        details.open
+          ? ui.expandedFiles.add(job.id)
+          : ui.expandedFiles.delete(job.id);
       });
-      links.append(retry);
+      card.append(details);
     }
-    if (!["preparing", "processing"].includes(job.status)) {
-      const remove = node("button", "job-delete", "Delete");
-      remove.setAttribute("aria-label", `Delete ${job.filename}`);
-      remove.addEventListener("click", () => {
-        ui.deleting = job;
-        $("#deleteFilename").textContent = job.filename;
-        $("#deleteDialog").showModal();
-      });
-      actions.append(remove);
-    }
-    if (links.childNodes.length || actions.childNodes.length > 1)
-      card.append(actions);
-    if (job.status === "done" && !job.srt_available)
-      card.append(
-        node(
-          "p",
-          "srt-note",
-          "Subtitles unavailable: complete word alignment was not returned.",
-        ),
-      );
     holder.append(card);
   }
+  return true;
 }
+
 function renderHistory(history) {
   const container = $("#history");
   container.replaceChildren();
@@ -423,6 +496,9 @@ function renderHistory(history) {
   }
 }
 function renderStats(stats) {
+  $("#combinedThroughput").textContent = stats.model_throughput_rtfx
+    ? `Combined model throughput: ${speed(stats.model_throughput_rtfx)} · ${stats.model_traced_files} completed files with full request tracing. Overlapping requests count once.`
+    : "Combined model throughput appears after a traced file completes.";
   $("#audioTotal").textContent = duration(stats.audio_s);
   $("#wallTotal").textContent = duration(stats.wall_s);
   $("#speedTotal").textContent = speed(stats.rtfx);
@@ -502,21 +578,20 @@ for (const button of document.querySelectorAll(".filter"))
     }
     renderJobs();
   });
-$("#search").addEventListener("input", renderJobs);
+
 let refreshing = false;
 async function refresh() {
   if (refreshing) return;
   refreshing = true;
   try {
     const [jobs, stats] = await Promise.all([
-      api("/api/jobs"),
+      api("/api/jobs?all=true"),
       api("/api/stats"),
     ]);
     ui.jobs = jobs.jobs;
     const snapshot = JSON.stringify(ui.jobs);
     if (snapshot !== ui.lastJobs) {
-      ui.lastJobs = snapshot;
-      renderJobs();
+      if (renderJobs() !== false) ui.lastJobs = snapshot;
     }
     renderStats(stats);
     renderFileStatistics();
@@ -561,7 +636,20 @@ setInterval(refresh, 2500);
 setInterval(refreshEngine, 8000);
 
 // Tabs keep the file queue, synchronized player and performance readout separate.
-function switchTab(name) {
+function switchTab(name, navigate = true) {
+  routeVersion++;
+  const selectedJob =
+    name === "player"
+      ? playback.jobId
+      : name === "corrections"
+        ? corrections.jobId
+        : null;
+  const target =
+    `/${name === "stats" ? "statistics" : name}` +
+    (selectedJob ? `?job=${encodeURIComponent(selectedJob)}` : "");
+  if (navigate && location.pathname + location.search !== target)
+    history.pushState({}, "", target);
+  document.title = `${name.charAt(0).toUpperCase() + name.slice(1)} · Nemotron Transcribe`;
   for (const button of document.querySelectorAll("[data-tab]")) {
     const selected = button.dataset.tab === name;
     button.setAttribute("aria-selected", String(selected));
@@ -593,9 +681,30 @@ $("#playerBack").addEventListener("click", () => {
   $("#filesNav").focus();
 });
 function renderFileStatistics() {
+  renderCorrectionPicker();
   const body = $("#fileStatistics");
   body.replaceChildren();
-  for (const job of ui.jobs.filter((j) => j.status === "done")) {
+  const completed = ui.jobs.filter((j) => j.status === "done"),
+    size = ui.statsPageSize || 10;
+  ui.statsPage = Math.max(
+    1,
+    Math.min(ui.statsPage || 1, Math.ceil(completed.length / size) || 1),
+  );
+  paginateControl(
+    "#statsPagination",
+    completed.length,
+    ui.statsPage,
+    size,
+    (page, pageSize) => {
+      ui.statsPage = page;
+      ui.statsPageSize = pageSize;
+      renderFileStatistics();
+    },
+  );
+  for (const job of completed.slice(
+    (ui.statsPage - 1) * size,
+    ui.statsPage * size,
+  )) {
     const row = node("tr");
     for (const value of [
       job.filename,
@@ -681,90 +790,220 @@ function alignedRanges(segment) {
       end: indices[cursor + length - 1].end,
       from: segment.start_seconds + start,
       to: segment.start_seconds + end,
+      speaker: word.speaker,
+      segmentIndex: segment.index,
     });
     cursor += length;
   }
   return { text, ranges };
 }
-function renderSyncedTranscript(result) {
+function wordButton(word, text) {
+  const button = node("button", "timed-word", text);
+  button.type = "button";
+  button.dataset.start = word.start;
+  button.dataset.end = word.end;
+  button.title = `Play from ${clock(word.start)}`;
+  if (word.speaker !== undefined && word.speaker !== null) {
+    button.dataset.speakerColor = String(
+      ((Number(String(word.speaker).replace(/[^0-9]/g, "")) || 0) % 3) + 1,
+    );
+    button.title += ` · Segment ${word.segmentIndex + 1}, speaker ${word.speaker}`;
+  }
+  button.addEventListener("click", () => {
+    if (!playback.media) return;
+    playback.media.currentTime = Math.max(
+      0,
+      word.start - Number($("#syncOffset").value || 0),
+    );
+    playback.manualScrollUntil = 0;
+    updateWordHighlight();
+    playback.media.play().catch(() => {
+      $("#mediaError").textContent = "Press Play to begin playback.";
+    });
+  });
+  playback.words.push({ ...word, element: button });
+  playback.maxWordDuration = Math.max(
+    playback.maxWordDuration,
+    word.end - word.start,
+  );
+  return button;
+}
+function renderSyncedTranscript(result, preserveFilter = false) {
+  playback.result = result;
   const container = $("#syncedTranscript");
   container.replaceChildren();
   playback.words = [];
   playback.highlighted = new Set();
   playback.maxWordDuration = 0;
-  let aligned = 0,
+  const groups = new Map();
+  for (const segment of result.segments || [])
+    for (const word of segment.words || []) {
+      if (
+        word.speaker === undefined ||
+        word.speaker === null ||
+        !Number.isFinite(word.start) ||
+        !Number.isFinite(word.end) ||
+        word.start < 0 ||
+        word.end <= word.start
+      )
+        continue;
+      const key = `${segment.index}|${word.speaker}`;
+      if (!groups.has(key))
+        groups.set(key, {
+          index: segment.index,
+          speaker: word.speaker,
+          offset: segment.start_seconds,
+          words: [],
+        });
+      groups.get(key).words.push(word);
+    }
+  const selected = $("#speakerFilter").value;
+  $("#speakerFilter").replaceChildren(node("option", "", "All speakers"));
+  $("#speakerFilter").firstChild.value = "all";
+  for (const [key, group] of groups) {
+    const option = node(
+      "option",
+      "",
+      `Segment ${group.index + 1} · Speaker ${group.speaker}`,
+    );
+    option.value = key;
+    $("#speakerFilter").append(option);
+  }
+  if (
+    preserveFilter &&
+    [...$("#speakerFilter").options].some((o) => o.value === selected)
+  )
+    $("#speakerFilter").value = selected;
+  $("#transcriptView").querySelector("[value=speakers]").disabled =
+    !groups.size;
+  if (!groups.size) $("#transcriptView").value = "full";
+  const bySpeaker = $("#transcriptView").value === "speakers";
+  $("#speakerFilter").hidden = !bySpeaker;
+  let partial = false,
+    aligned = 0,
     unaligned = 0;
-  for (const segment of result.segments || []) {
-    if (!segment.text?.trim()) continue;
-    const paragraph = node("p", "transcript-segment"),
-      data = alignedRanges(segment);
-    if (data) {
-      let position = 0;
-      for (const range of data.ranges) {
-        paragraph.append(
-          document.createTextNode(data.text.slice(position, range.start)),
-        );
-        const button = node(
-          "button",
-          "timed-word",
-          data.text.slice(range.start, range.end),
-        );
-        button.type = "button";
-        button.title = `Play from ${clock(range.from)}`;
-        button.dataset.start = range.from;
-        button.dataset.end = range.to;
-        button.addEventListener("click", () => {
-          if (!playback.media) return;
-          playback.media.currentTime = range.from;
-          playback.manualScrollUntil = 0;
-          updateWordHighlight();
-          playback.media.play().catch(() => {
-            $("#mediaError").textContent = "Press Play to begin playback.";
-          });
-        });
-        paragraph.append(button);
-        playback.words.push({
-          start: range.from,
-          end: range.to,
-          element: button,
-        });
-        playback.maxWordDuration = Math.max(
-          playback.maxWordDuration,
-          range.to - range.from,
-        );
-        position = range.end;
-      }
-      paragraph.append(document.createTextNode(data.text.slice(position)));
-      aligned++;
-    } else {
-      paragraph.append(document.createTextNode(segment.text));
+  if (bySpeaker) {
+    for (const [key, group] of groups) {
+      if (
+        $("#speakerFilter").value !== "all" &&
+        $("#speakerFilter").value !== key
+      )
+        continue;
+      const paragraph = node("p", "transcript-segment");
       paragraph.append(
         node(
           "span",
-          "unaligned-label",
-          "Word timing unavailable for this segment.",
+          "speaker-label",
+          `Segment ${group.index + 1} · Speaker ${group.speaker}`,
         ),
       );
-      unaligned++;
+      for (const word of group.words) {
+        paragraph.append(
+          wordButton(
+            {
+              start: group.offset + word.start,
+              end: group.offset + word.end,
+              speaker: word.speaker,
+              segmentIndex: group.index,
+            },
+            word.word,
+          ),
+          document.createTextNode(" "),
+        );
+      }
+      container.append(paragraph);
     }
-    container.append(paragraph);
+    $("#alignmentNote").textContent =
+      "Word-aligned text grouped by speaker. IDs are local to each segment; alignment wording may differ from the formatted transcript.";
+  } else {
+    for (const segment of result.segments || []) {
+      if (!segment.text?.trim()) continue;
+      const paragraph = node("p", "transcript-segment");
+      let position = 0;
+      const mapped = segment.playback_words;
+      let ranges;
+      if (Array.isArray(mapped))
+        ranges = mapped.map((w) => ({
+          start: w.char_start,
+          end: w.char_end,
+          from: segment.start_seconds + w.start,
+          to: segment.start_seconds + w.end,
+          speaker: w.speaker,
+          segmentIndex: segment.index,
+        }));
+      else ranges = alignedRanges(segment)?.ranges;
+      if (ranges?.length) {
+        for (const range of ranges) {
+          if (
+            range.start < position ||
+            range.end > segment.text.length ||
+            !Number.isFinite(range.from) ||
+            !Number.isFinite(range.to) ||
+            range.to <= range.from
+          )
+            continue;
+          paragraph.append(
+            document.createTextNode(segment.text.slice(position, range.start)),
+          );
+          paragraph.append(
+            wordButton(
+              {
+                start: range.from,
+                end: range.to,
+                speaker: range.speaker,
+                segmentIndex: segment.index,
+              },
+              segment.text.slice(range.start, range.end),
+            ),
+          );
+          position = range.end;
+        }
+        paragraph.append(document.createTextNode(segment.text.slice(position)));
+        aligned++;
+        if (!segment.alignment_valid) partial = true;
+      } else {
+        paragraph.append(document.createTextNode(segment.text));
+        paragraph.append(
+          node(
+            "span",
+            "unaligned-label",
+            "Word timing unavailable for this segment.",
+          ),
+        );
+        unaligned++;
+      }
+      container.append(paragraph);
+    }
+    $("#alignmentNote").textContent =
+      aligned && !unaligned && !partial
+        ? "Click any timed word to seek. Highlighting follows playback."
+        : aligned
+          ? "Only words matched to real model alignment are highlighted. Unmatched text remains readable without invented timings."
+          : "No valid word timing is available. The full transcript remains readable.";
   }
   if (!container.childNodes.length)
     container.append(node("p", "", result.text || "No speech detected."));
   playback.words.sort((a, b) => a.start - b.start);
-  $("#alignmentNote").textContent =
-    aligned && !unaligned
-      ? "Words follow playback. Click any word to seek."
-      : aligned
-        ? "Some segments have no word alignment; highlighting is available only where the model returned valid times."
-        : "This recording has no valid word alignment. The full text is available without synchronized highlighting.";
+  $("#jumpFirstWord").disabled = !playback.words.length;
+  $("#speakerLegend").replaceChildren();
+  if (groups.size)
+    $("#speakerLegend").append(
+      node(
+        "span",
+        "speaker-key",
+        `${groups.size} segment/speaker groups · use By speaker to filter`,
+      ),
+    );
   container.scrollTop = 0;
+  updateWordHighlight();
 }
+
 function updateWordHighlight() {
   const media = playback.media;
   if (!media) return;
-  const time = media.currentTime;
-  $("#playbackTime").textContent = `${clock(time)} / ${clock(media.duration)}`;
+  const time = media.currentTime + Number($("#syncOffset").value || 0);
+  $("#playbackTime").textContent =
+    `${clock(media.currentTime)} / ${clock(media.duration)}`;
   const words = playback.words;
   let lo = 0,
     hi = words.length;
@@ -793,6 +1032,12 @@ function updateWordHighlight() {
       newest = element;
     }
   playback.highlighted = current;
+  const first = playback.words[0];
+  $("#syncStatus").textContent = current.size
+    ? "Following aligned words"
+    : first && time < first.start
+      ? `First aligned speech at ${clock(first.start)}. No aligned words before this point.`
+      : "No aligned word at the current playback position.";
   if (
     newest &&
     $("#followPlayback").checked &&
@@ -816,11 +1061,13 @@ function animatePlayback() {
   if (playback.media && !playback.media.paused && !playback.media.ended)
     playback.frame = requestAnimationFrame(animatePlayback);
 }
-async function showPlayer(job) {
+async function showPlayer(job, navigate = true) {
+  playback.jobId = job.id;
+  $("#transcriptView").value = "full";
   const request = ++playback.request;
   if (playback.media) playback.media.pause();
   if (playback.frame) cancelAnimationFrame(playback.frame);
-  switchTab("player");
+  switchTab("player", navigate);
   $("#playerTitle").textContent = job.filename;
   $("#playerSubtitle").textContent =
     `${duration(job.duration_s)} · ${job.language.toUpperCase()} · ${speed(job.rtfx)} processing speed`;
@@ -829,6 +1076,7 @@ async function showPlayer(job) {
   $("#mediaError").textContent = "";
   $("#alignmentNote").textContent = "Loading transcript…";
   $("#syncedTranscript").replaceChildren(node("p", "", "Loading…"));
+  $("#syncOffset").value = "0";
   $("#mediaMount").replaceChildren();
   playback.words = [];
   playback.highlighted = new Set();
@@ -879,6 +1127,7 @@ async function showPlayer(job) {
     media.playbackRate = Number($("#playbackSpeed").value);
     for (const event of [
       "timeupdate",
+      "seeking",
       "seeked",
       "loadedmetadata",
       "durationchange",
@@ -962,6 +1211,8 @@ function renderInfo(info) {
         ? "Memory-mapped weights; one model, one worker"
         : "One model, one worker",
     ],
+    ["Parallel file limit", String(info.settings?.parallel_jobs ?? 1)],
+    ["Decode capacity", String(info.engine_capacity ?? 16)],
     ["Subtitles", "Only when model word alignment is valid"],
   ]);
   infoRows("#gpuInfo", [
@@ -995,6 +1246,7 @@ function renderInfo(info) {
     ],
     ["Model snapshot", lock?.model_revision],
     ["Upload limit", `${info.max_upload_mb} MB per file`],
+    ["Accepted file types", (info.accepted_filetypes || []).join(", ")],
     [
       "Retention",
       info.retention_days
@@ -1002,4 +1254,513 @@ function renderInfo(info) {
         : "Until manually deleted",
     ],
   ]);
+}
+
+$("#syncOffset").addEventListener("input", updateWordHighlight);
+$("#jumpFirstWord").addEventListener("click", () => {
+  const first = playback.words[0];
+  if (first && playback.media) {
+    playback.media.currentTime = Math.max(
+      0,
+      first.start - Number($("#syncOffset").value || 0),
+    );
+    updateWordHighlight();
+  }
+});
+function languageOptions(select, languages, special, value) {
+  select.replaceChildren(node("option", "", special[1]));
+  select.firstChild.value = special[0];
+  for (const [code, name] of Object.entries(languages).sort((a, b) =>
+    a[1].localeCompare(b[1]),
+  )) {
+    const option = node("option", "", name);
+    option.value = code;
+    select.append(option);
+  }
+  select.value = value;
+}
+function speakerAvailability() {
+  for (const [input, output, checkbox] of [
+    ["#language", "#outputLanguage", "#diarize"],
+    ["#defaultInputLanguage", "#defaultOutputLanguage", "#defaultDiarize"],
+  ]) {
+    const translated =
+      $(output).value !== "source" && $(output).value !== $(input).value;
+    $(checkbox).disabled = translated;
+    if (translated) $(checkbox).checked = false;
+  }
+}
+async function loadSettings() {
+  try {
+    const response = await api("/api/settings"),
+      s = response.settings;
+    for (const [id, special, value] of [
+      ["#language", ["auto", "Auto-detect"], s.input_language],
+      ["#outputLanguage", ["source", "Same as spoken"], s.output_language],
+      ["#defaultInputLanguage", ["auto", "Auto-detect"], s.input_language],
+      [
+        "#defaultOutputLanguage",
+        ["source", "Same as spoken"],
+        s.output_language,
+      ],
+    ])
+      languageOptions($(id), response.languages, special, value);
+    $("#duration").value = s.segment_seconds;
+    $("#diarize").checked = s.diarize;
+    $("#defaultChunk").value = s.segment_seconds;
+    $("#defaultDiarize").checked = s.diarize;
+    $("#parallelLevel").value = [1, 2, 4, 8, 16].includes(s.parallel_jobs)
+      ? String(s.parallel_jobs)
+      : "custom";
+    $("#customParallel").value = s.parallel_jobs;
+    $("#customParallel").max = response.engine_capacity;
+    $("#customParallelRow").hidden = $("#parallelLevel").value !== "custom";
+    $("#parallelCapacity").textContent =
+      `Runtime capacity: ${response.engine_capacity} shared decode slots. ${response.active_jobs} file(s) active. Reducing concurrency takes effect as active files finish.`;
+    speakerAvailability();
+  } catch (e) {
+    $("#settingsMessage").textContent = `Could not load settings: ${e.message}`;
+  }
+}
+$("#parallelLevel").addEventListener("change", () => {
+  $("#customParallelRow").hidden = $("#parallelLevel").value !== "custom";
+});
+for (const id of [
+  "#language",
+  "#outputLanguage",
+  "#defaultInputLanguage",
+  "#defaultOutputLanguage",
+])
+  $(id).addEventListener("change", speakerAvailability);
+$("#settingsForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const button = e.currentTarget.querySelector("button[type=submit]");
+  button.disabled = true;
+  const values = {
+    parallel_jobs: Number(
+      $("#parallelLevel").value === "custom"
+        ? $("#customParallel").value
+        : $("#parallelLevel").value,
+    ),
+    segment_seconds: Number($("#defaultChunk").value),
+    input_language: $("#defaultInputLanguage").value,
+    output_language: $("#defaultOutputLanguage").value,
+    diarize: $("#defaultDiarize").checked,
+  };
+  try {
+    await api("/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(values),
+    });
+    await loadSettings();
+    $("#settingsMessage").textContent =
+      "Saved. Defaults apply to new uploads; queue concurrency updates automatically.";
+  } catch (error) {
+    $("#settingsMessage").textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+});
+loadSettings();
+
+$("#transcriptView").addEventListener("change", () => {
+  if (playback.result) renderSyncedTranscript(playback.result);
+});
+$("#speakerFilter").addEventListener("change", () => {
+  if (playback.result) renderSyncedTranscript(playback.result, true);
+});
+async function restoreRoute() {
+  const name =
+      location.pathname.slice(1) === "statistics"
+        ? "stats"
+        : location.pathname.slice(1),
+    tab = [
+      "upload",
+      "files",
+      "player",
+      "stats",
+      "info",
+      "settings",
+      "corrections",
+    ].includes(name)
+      ? name
+      : "upload";
+  switchTab(tab, false);
+  const version = routeVersion;
+  const id = new URLSearchParams(location.search).get("job");
+  if (tab === "player" && id && playback.jobId !== id) {
+    try {
+      const job = await api(`/api/jobs/${encodeURIComponent(id)}`);
+      if (version !== routeVersion) return;
+      if (job.status === "done") await showPlayer(job, false);
+      else
+        $("#playerSubtitle").textContent =
+          "This recording is still processing. Open Files to follow its progress.";
+    } catch (error) {
+      $("#playerSubtitle").textContent = error.message;
+    }
+  } else if (tab === "corrections" && id && corrections.jobId !== id) {
+    await showCorrections(id, false);
+  } else if (tab === "files" && id) {
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const card = document.querySelector(`[data-job-id="${CSS.escape(id)}"]`);
+      if (card) {
+        card.classList.add("recent-upload");
+        card.scrollIntoView({ block: "center" });
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+}
+window.addEventListener("popstate", restoreRoute);
+
+function renderCorrectionPicker() {
+  const select = $("#correctionFile");
+  if (!select) return;
+  const old = corrections.jobId || select.value;
+  select.replaceChildren(node("option", "", "Choose a recording"));
+  select.firstChild.value = "";
+  const completed = ui.jobs.filter((j) => j.status === "done"),
+    size = ui.statsPageSize || 10;
+  ui.statsPage = Math.max(
+    1,
+    Math.min(ui.statsPage || 1, Math.ceil(completed.length / size) || 1),
+  );
+  paginateControl(
+    "#statsPagination",
+    completed.length,
+    ui.statsPage,
+    size,
+    (page, pageSize) => {
+      ui.statsPage = page;
+      ui.statsPageSize = pageSize;
+      renderFileStatistics();
+    },
+  );
+  for (const job of completed.slice(
+    (ui.statsPage - 1) * size,
+    ui.statsPage * size,
+  )) {
+    const option = node("option", "", job.filename);
+    option.value = job.id;
+    select.append(option);
+  }
+  if (old && [...select.options].some((o) => o.value === old))
+    select.value = old;
+}
+function correctionDraftKey() {
+  return `nemotron-review:${corrections.jobId}`;
+}
+function countCorrection() {
+  $("#correctionCount").textContent =
+    `${$("#correctionText").value.trim() ? $("#correctionText").value.trim().split(/\s+/u).length : 0} words`;
+}
+function keepCorrectionDraft() {
+  try {
+    sessionStorage.setItem(
+      correctionDraftKey(),
+      JSON.stringify({
+        text: $("#correctionText").value,
+        revision: corrections.revision,
+      }),
+    );
+  } catch {
+    $("#correctionStatus").textContent =
+      "Browser draft storage is full. Save or export your text.";
+  }
+}
+async function saveReview() {
+  if (!corrections.jobId) return true;
+  if (corrections.pending) {
+    await corrections.pending;
+    return $("#correctionText").value === corrections.savedText
+      ? true
+      : corrections.conflict
+        ? false
+        : saveReview();
+  }
+  const text = $("#correctionText").value;
+  if (text === corrections.savedText) return true;
+  if (corrections.conflict) return false;
+  const id = corrections.jobId,
+    revision = corrections.revision;
+  $("#correctionStatus").textContent = "Saving…";
+  let success = false;
+  corrections.pending = (async () => {
+    try {
+      const result = await api(
+        `/api/jobs/${encodeURIComponent(id)}/correction`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, revision }),
+        },
+      );
+      if (corrections.jobId === id) {
+        corrections.revision = result.revision;
+        corrections.savedText = text;
+        $("#correctionStatus").textContent =
+          $("#correctionText").value === text
+            ? "All changes saved"
+            : "Saving newer edits…";
+        if ($("#correctionText").value === text)
+          sessionStorage.removeItem(correctionDraftKey());
+        else keepCorrectionDraft();
+      }
+      success = true;
+    } catch (error) {
+      if (corrections.jobId === id) {
+        corrections.conflict = error.message.includes("newer revision");
+        $("#correctionStatus").textContent = corrections.conflict
+          ? "Another tab saved changes. Export your draft before reloading."
+          : "Save pending — your draft is kept in this tab.";
+        keepCorrectionDraft();
+      }
+    }
+  })();
+  await corrections.pending;
+  corrections.pending = null;
+  if (success && $("#correctionText").value !== corrections.savedText) {
+    clearTimeout(corrections.timer);
+    corrections.timer = setTimeout(saveReview, 500);
+  }
+  return success;
+}
+async function showCorrections(id, navigate = true) {
+  if (corrections.jobId !== id && corrections.jobId && !(await saveReview())) {
+    feedback(
+      "Save or export your current draft before switching recordings.",
+      true,
+    );
+    return;
+  }
+  const request = ++corrections.request;
+  if (corrections.media) corrections.media.pause();
+  if (playback.media) playback.media.pause();
+  corrections.jobId = id;
+  corrections.conflict = false;
+  switchTab("corrections", navigate);
+  $("#correctionWorkspace").hidden = false;
+  $("#correctionEmpty").hidden = true;
+  $("#correctionText").disabled = true;
+  $("#correctionStatus").textContent = "Loading…";
+  try {
+    const [job, review] = await Promise.all([
+      api(`/api/jobs/${encodeURIComponent(id)}`),
+      api(`/api/jobs/${encodeURIComponent(id)}/correction`),
+    ]);
+    if (request !== corrections.request) return;
+    corrections.filename = job.filename;
+    corrections.revision = review.revision;
+    corrections.savedText = review.text;
+    $("#correctionText").value = review.text;
+    $("#correctionText").lang = job.language === "auto" ? "" : job.language;
+    $("#correctionTitle").textContent = job.filename;
+    $("#correctionStatus").textContent = review.revision
+      ? "All changes saved"
+      : "Original transcript · start editing";
+    try {
+      const draft = JSON.parse(
+        sessionStorage.getItem(correctionDraftKey()) || "null",
+      );
+      if (draft && draft.text !== review.text) {
+        $("#correctionText").value = draft.text;
+        corrections.conflict = draft.revision !== review.revision;
+        $("#correctionStatus").textContent = corrections.conflict
+          ? "Draft restored; a newer server version also exists. Export your draft before reloading."
+          : "Unsaved draft restored";
+      }
+    } catch {}
+    $("#correctionText").disabled = false;
+    countCorrection();
+    renderCorrectionPicker();
+    $("#correctionFile").value = id;
+    const video = ["mp4", "webm", "mkv", "mov", "avi"].includes(
+        job.filename.split(".").pop().toLowerCase(),
+      ),
+      media = node(video ? "video" : "audio");
+    media.controls = true;
+    media.preload = "metadata";
+    media.src = `/api/jobs/${encodeURIComponent(id)}/media`;
+    media.playbackRate = Number($("#correctionSpeed").value);
+    media.setAttribute("aria-label", job.filename);
+    $("#correctionMediaMount").replaceChildren(media);
+    corrections.media = media;
+    media.addEventListener("error", () => {
+      $("#correctionStatus").textContent =
+        "The browser could not play this recording. Your text remains available.";
+    });
+  } catch (error) {
+    $("#correctionStatus").textContent = error.message;
+  }
+}
+$("#correctionFile").addEventListener("change", (e) => {
+  if (e.target.value) showCorrections(e.target.value);
+});
+$("#correctionText").addEventListener("input", () => {
+  countCorrection();
+  keepCorrectionDraft();
+  $("#correctionStatus").textContent = corrections.conflict
+    ? "Draft kept in this tab; resolve the newer saved version before saving."
+    : "Unsaved changes";
+  clearTimeout(corrections.timer);
+  corrections.timer = setTimeout(saveReview, 1000);
+});
+$("#saveCorrection").addEventListener("click", saveReview);
+$("#rewindCorrection").addEventListener("click", () => {
+  if (corrections.media)
+    corrections.media.currentTime = Math.max(
+      0,
+      corrections.media.currentTime - 5,
+    );
+});
+function toggleReview() {
+  if (!corrections.media) return;
+  corrections.media.paused
+    ? corrections.media.play().catch(() => {
+        $("#correctionStatus").textContent =
+          "Press Play on the recording to start.";
+      })
+    : corrections.media.pause();
+}
+$("#toggleCorrection").addEventListener("click", toggleReview);
+$("#correctionSpeed").addEventListener("change", () => {
+  if (corrections.media)
+    corrections.media.playbackRate = Number($("#correctionSpeed").value);
+});
+async function exportReview(format) {
+  if (!corrections.jobId) return;
+  const saved = await saveReview(),
+    text = $("#correctionText").value;
+  const contents =
+    format === "txt"
+      ? text
+      : JSON.stringify(
+          {
+            original_filename: corrections.filename,
+            text,
+            revision: corrections.revision,
+            saved,
+            timing_source: null,
+          },
+          null,
+          2,
+        );
+  const url = URL.createObjectURL(
+      new Blob([contents], {
+        type:
+          format === "txt"
+            ? "text/plain;charset=utf-8"
+            : "application/json;charset=utf-8",
+      }),
+    ),
+    link = node("a");
+  link.href = url;
+  link.download =
+    corrections.filename.replace(/\.[^.]+$/u, "").slice(0, 90) +
+    `-corrected.${format}`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  if (!saved)
+    $("#correctionStatus").textContent =
+      "Draft exported. Server save is still pending.";
+}
+$("#exportCorrection").addEventListener("click", () => exportReview("txt"));
+$("#exportCorrectionJson").addEventListener("click", () =>
+  exportReview("json"),
+);
+window.addEventListener("keydown", (e) => {
+  if ($("#correctionsTab").hidden) return;
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+    e.preventDefault();
+    saveReview();
+  }
+  if (e.altKey && e.code === "Space") {
+    e.preventDefault();
+    toggleReview();
+  }
+});
+window.addEventListener("beforeunload", (e) => {
+  if (
+    corrections.jobId &&
+    $("#correctionText").value !== corrections.savedText
+  ) {
+    keepCorrectionDraft();
+    e.preventDefault();
+    e.returnValue = "";
+  }
+});
+restoreRoute();
+for (const button of document.querySelectorAll("[data-file-status]"))
+  button.addEventListener("click", () => {
+    ui.fileStatus = button.dataset.fileStatus;
+    ui.filePage = 1;
+    renderJobs();
+    if (location.pathname === "/files") {
+      const url = new URL(location.href);
+      url.searchParams.set("status", ui.fileStatus);
+      history.replaceState({}, "", url);
+    }
+  });
+$("#fileSort").addEventListener("change", () => {
+  renderJobs();
+  if (location.pathname === "/files") {
+    const url = new URL(location.href);
+    url.searchParams.set("sort", $("#fileSort").value);
+    history.replaceState({}, "", url);
+  }
+});
+if (location.pathname === "/files") {
+  const params = new URLSearchParams(location.search);
+  ui.fileStatus = ["all", "queued", "processing", "done", "failed"].includes(
+    params.get("status"),
+  )
+    ? params.get("status")
+    : "all";
+  if (["newest", "oldest", "status", "name"].includes(params.get("sort")))
+    $("#fileSort").value = params.get("sort");
+}
+
+function paginateControl(target, total, page, size, change) {
+  const holder = $(target);
+  if (!holder) return;
+  holder.replaceChildren();
+  const label = node("label", "pagination-size", "Rows per page "),
+    select = node("select");
+  select.setAttribute(
+    "aria-label",
+    target === "#filePagination"
+      ? "Files rows per page"
+      : "Statistics rows per page",
+  );
+  for (const value of [10, 25, 50]) {
+    const option = node("option", "", String(value));
+    option.value = value;
+    select.append(option);
+  }
+  select.value = size;
+  select.addEventListener("change", () => change(1, Number(select.value)));
+  label.append(select);
+  const info = node(
+      "span",
+      "",
+      total
+        ? `${(page - 1) * size + 1}–${Math.min(page * size, total)} of ${total}`
+        : "0 files",
+    ),
+    prev = node("button", "secondary", "‹"),
+    next = node("button", "secondary", "›");
+  prev.setAttribute("aria-label", "Previous page");
+  next.setAttribute("aria-label", "Next page");
+  prev.disabled = page <= 1;
+  next.disabled = page * size >= total;
+  prev.addEventListener("click", () => change(page - 1, size));
+  next.addEventListener("click", () => change(page + 1, size));
+  const controls = node("div");
+  controls.append(info, prev, next);
+  holder.append(label, controls);
 }

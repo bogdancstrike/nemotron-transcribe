@@ -7,10 +7,11 @@ asr:
   salm:
     encoder_path: /models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-Encoder-F16.gguf
     n_cpu_moe: 48
-    max_sequences: 1
-    n_ctx_per_sequence: 16384
+    max_sequences: 16
+    n_ctx_per_sequence: 1024
     max_context: 16384
     mtp_draft: 0
     max_new_tokens: 4096
     n_batch: 512
     encoder_max_batch: 1
+    encoder_ahead_seconds: 600

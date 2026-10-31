@@ -3,8 +3,8 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg tini \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.lock ./
+RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 COPY . ./
 RUN useradd -u 10001 -m app && mkdir -p /data && chown -R app:app /data /app
 USER app

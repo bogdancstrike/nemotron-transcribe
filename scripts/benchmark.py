@@ -74,6 +74,13 @@ class Monitor:
             if process:
                 process.cpu_percent()
             while not self.stop.is_set():
+                if process and not process.is_running():
+                    try:
+                        self.pid = engine_pid()
+                        process = psutil.Process(self.pid)
+                        process.cpu_percent()
+                    except (OSError, psutil.Error, subprocess.SubprocessError, ValueError, RuntimeError):
+                        pass
                 rss = cpu = gpu = util = engine_gpu = None
                 if process:
                     try:

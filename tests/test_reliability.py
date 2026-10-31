@@ -242,3 +242,137 @@ def test_restart_outage_resumes_current_chunk_once(isolated,wav_bytes,monkeypatc
     assert len(calls)==2
     assert waited==[900.0]
     assert db.get_job('outage')['status']=='done'
+
+
+def test_settings_persist_and_bound_parallel_claims(isolated):
+    db.save_settings({'parallel_jobs':4,'input_language':'auto','output_language':'ro','segment_seconds':60})
+    assert db.get_settings()['parallel_jobs']==4
+    for n in range(6):db.create_job(str(n),'x.wav','/tmp/x','auto',60,False)
+    assert all(db.claim_job(4) for _ in range(4))
+    assert db.claim_job(4) is None
+    with pytest.raises(ValueError):db.save_settings({'parallel_jobs':999})
+    with pytest.raises(ValueError):db.save_settings({'parallel_jobs':True})
+    with pytest.raises(ValueError):db.save_settings({'unknown':1})
+    with TestClient(main.app) as client:
+        assert client.get('/api/settings').json()['settings']['output_language']=='ro'
+        assert client.put('/api/settings',json={'parallel_jobs':2}).status_code==200
+        assert client.put('/api/settings',json={'output_language':'en','diarize':True}).status_code==400
+
+
+def test_upload_defaults_input_output_languages(isolated,wav_bytes):
+    db.save_settings({'input_language':'auto','output_language':'en','segment_seconds':60})
+    with TestClient(main.app) as client:
+        response=client.post('/api/jobs',files={'file':('x.m4a',wav_bytes)})
+        assert response.status_code==201
+        job=client.get('/api/jobs/'+response.json()['id']).json()
+        assert job['language']=='auto'
+        assert job['output_language']=='en'
+        assert job['segment_seconds']==60
+        assert client.post('/api/jobs',files={'file':('x.m4a',wav_bytes)},data={'language':'ro','output_language':'en','diarize':'true'}).status_code==400
+
+
+def test_translation_uses_documented_endpoint(isolated,wav_bytes,monkeypatch):
+    path=isolated/'x.wav';path.write_bytes(wav_bytes)
+    real_client=httpx.Client;requests=[]
+    def reply(request):
+        requests.append(request)
+        return httpx.Response(200,json={'text':'Hello world','task':'translate','language':'en','duration':2})
+    monkeypatch.setattr(worker.httpx,'Client',lambda **kwargs:real_client(transport=httpx.MockTransport(reply),**kwargs))
+    result=worker.transcribe_chunk(path,'ro',False,'en')
+    assert result['text']=='Hello world'
+    assert requests[0].url.path=='/v1/audio/translations'
+    body=requests[0].content.decode(errors='replace')
+    assert 'target_language' in body
+    assert 'diarization' not in body
+    assert not result.get('words')
+
+
+def test_concurrent_throughput_counts_overlap_once(isolated):
+    for id in ('a','b'):
+        db.create_job(id,'x.wav','/tmp/x','ro',60,False)
+        db.update_job(id,status='done',duration_s=60,inference_s=10,wall_s=11)
+        db.record_interval(id,'2026-10-31T10:00:00+00:00','2026-10-31T10:00:10+00:00')
+    result=db.model_throughput()
+    assert result['model_busy_s']==10
+    assert result['model_throughput_rtfx']==12
+    assert result['model_traced_files']==2
+
+
+def test_downloader_verifies_and_atomically_replaces_manifest(tmp_path,monkeypatch):
+    import importlib.util
+    import hashlib
+    import sys
+    spec=importlib.util.spec_from_file_location('download_model',Path(__file__).resolve().parents[1]/'scripts/download_model.py')
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    models=tmp_path/'models';models.mkdir()
+    file=models/'test.gguf';file.write_bytes(b'GGUFtest')
+    lock={'model_repo':'test','model_revision':'test','files':[{'filename':file.name,'size':8,'sha256':hashlib.sha256(b'GGUFtest').hexdigest()}]}
+    (tmp_path/'runtime.lock.json').write_text(json.dumps(lock))
+    manifest=models/'manifest.json';manifest.write_text('{}');manifest.chmod(0o444)
+    monkeypatch.setattr(module,'ROOT',tmp_path)
+    monkeypatch.setattr(sys,'argv',['download_model','--models-dir',str(models),'--verify-only'])
+    module.main()
+    assert json.loads(manifest.read_text())['model_repo']=='test'
+
+
+def test_partial_alignment_maps_only_real_matching_words():
+    segment={'text':'Salut, lume minunată!','duration_s':3,'words':[
+        {'word':'Salut','start':.1,'end':.4,'speaker':1},
+        {'word':'lume','start':.5,'end':.8,'speaker':2},
+        {'word':'altceva','start':1,'end':1.5}]}
+    words=worker.playback_words(segment)
+    assert [word['word'] for word in words]==['Salut','lume']
+    assert [(word['start'],word['end']) for word in words]==[(.1,.4),(.5,.8)]
+    assert words[1]['speaker']==2
+    assert worker.srt_from_segments([{'start_seconds':0,**segment}])==''
+
+
+def test_canonical_page_routes_survive_reload(isolated):
+    with TestClient(main.app) as client:
+        assert client.get('/',follow_redirects=False).headers['location']=='/upload'
+        for page in ('upload','files','player','statistics','info','settings'):
+            response=client.get('/'+page)
+            assert response.status_code==200
+            assert '<!doctype html>' in response.text.lower()
+
+
+@pytest.mark.parametrize('parallel',[1,2,4,8,16])
+def test_parallel_limits_remain_atomic(isolated,parallel):
+    for n in range(20):db.create_job(str(n),'x.wav','/tmp/x','ro',60,False)
+    with concurrent.futures.ThreadPoolExecutor(20) as pool:
+        claimed=list(pool.map(lambda _:db.claim_job(parallel),range(20)))
+    assert sum(row is not None for row in claimed)==parallel
+
+
+def test_corrections_are_revisioned_and_preserve_original(isolated,wav_bytes):
+    with TestClient(main.app) as client:
+        id=client.post('/api/jobs',files={'file':('Știință.wav',wav_bytes)}).json()['id']
+        assert client.get(f'/api/jobs/{id}/correction').status_code==409
+        out=isolated/'results'/id;out.mkdir();(out/'transcript.txt').write_text('Text original.\n',encoding='utf-8')
+        db.update_job(id,status='done')
+        original=client.get(f'/api/jobs/{id}/correction').json()
+        assert original['revision']==0
+        updated=client.put(f'/api/jobs/{id}/correction',json={'text':'Țară, școală, înghețată.','revision':0})
+        assert updated.status_code==200
+        assert updated.json()['revision']==1
+        conflict=client.put(f'/api/jobs/{id}/correction',json={'text':'Another tab','revision':0})
+        assert conflict.status_code==409
+        assert client.get(f'/api/jobs/{id}/correction/download/txt').text=='Țară, școală, înghețată.'
+        assert client.get(f'/api/jobs/{id}/download/txt').text=='Text original.\n'
+        exported=client.get(f'/api/jobs/{id}/correction/download/json').json()
+        assert exported['timing_source'] is None
+        assert client.get(f'/api/jobs/{id}/correction/download/srt').status_code==404
+        assert client.put(f'/api/jobs/{id}/correction',json={'text':'x','revision':True}).status_code==400
+        assert client.delete(f'/api/jobs/{id}').status_code==204
+        assert db.get_correction(id) is None
+
+
+def test_correction_conflict_is_atomic(isolated):
+    db.create_job('review','x.wav','/tmp/x','ro',60,False)
+    def save(text):
+        try:return db.save_correction('review',text,0)['revision']
+        except ValueError:return 'conflict'
+    with concurrent.futures.ThreadPoolExecutor(2) as pool:
+        results=list(pool.map(save,['First review','Second review']))
+    assert results.count(1)==1
+    assert results.count('conflict')==1

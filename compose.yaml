@@ -90,6 +90,7 @@ services:
       MAX_PENDING_JOBS: ${MAX_PENDING_JOBS:-100}
       RETENTION_DAYS: ${RETENTION_DAYS:-0}
       NEMO_MODE: cpu
+      ENGINE_MAX_PARALLEL: 16
       RUNTIME_LOCK_FILE: /runtime-lock.json
     volumes:
       - ./data:/data
@@ -117,6 +118,7 @@ services:
       MIN_FREE_DISK_MB: ${MIN_FREE_DISK_MB:-1024}
       RETENTION_DAYS: ${RETENTION_DAYS:-0}
       NEMO_MODE: cpu
+      ENGINE_MAX_PARALLEL: 16
     volumes:
       - ./data:/data
     depends_on:
@@ -133,6 +135,7 @@ services:
     environment:
       DATA_DIR: /data
       NEMO_MODE: cpu
+      ENGINE_MAX_PARALLEL: 16
     volumes:
       - ./data:/data
     depends_on:
