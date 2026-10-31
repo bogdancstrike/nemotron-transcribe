@@ -41,54 +41,33 @@ Seven focused pages. One local workspace.
 
 Fresh captures from the running Docker deployment. Job status and resource readings are real snapshots, not demo values.
 
-<details>
-<summary><strong>Upload — centered file chooser</strong></summary>
+### Upload — centered file chooser
 
 ![Upload — centered file chooser](assets/upload.png)
 
-</details>
-
-<details>
-<summary><strong>Files — status views, sorting, pagination and actions</strong></summary>
+### Files — status views, sorting, pagination and actions
 
 ![Files — status views, sorting, pagination and actions](assets/files.png)
 
-</details>
-
-<details>
-<summary><strong>Player — synchronized reading and playback</strong></summary>
+### Player — synchronized reading and playback
 
 ![Player — synchronized reading and playback](assets/player.png)
 
-</details>
-
-<details>
-<summary><strong>Statistics — measured per-file and combined throughput</strong></summary>
+### Statistics — measured per-file and combined throughput
 
 ![Statistics — measured per-file and combined throughput](assets/statistics.png)
 
-</details>
-
-<details>
-<summary><strong>Corrections — compact editor, autosave and export</strong></summary>
+### Corrections — compact editor, autosave and export
 
 ![Corrections — compact editor, autosave and export](assets/corrections.png)
 
-</details>
-
-<details>
-<summary><strong>Info — hardware consumption, deployment and accepted formats</strong></summary>
+### Info — hardware consumption, deployment and accepted formats
 
 ![Info — hardware consumption, deployment and accepted formats](assets/info.png)
 
-</details>
-
-<details>
-<summary><strong>Settings — concurrency, languages, numbers and speakers</strong></summary>
+### Settings — concurrency, languages, numbers and speakers
 
 ![Settings — concurrency, languages, numbers and speakers](assets/settings.png)
-
-</details>
 
 ## Quick start
 
