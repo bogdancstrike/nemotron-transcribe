@@ -34,6 +34,45 @@ Five tabs. One local workspace.
 
 **No invented timestamps.** If alignment is missing, invalid or partial, text remains available; synchronized highlighting and SRT are withheld for unaligned text.
 
+## Screenshots
+
+Captured from the running local application. Resource readings and job status reflect the moment each screenshot was taken.
+
+<details>
+<summary><strong>Upload — centered file chooser</strong></summary>
+
+![Upload page](assets/upload.png)
+
+</details>
+
+<details>
+<summary><strong>Files — queue, progress, retry and exports</strong></summary>
+
+![Files page](assets/files.png)
+
+</details>
+
+<details>
+<summary><strong>Player — recording and synchronized transcript</strong></summary>
+
+![Player page](assets/player.png)
+
+</details>
+
+<details>
+<summary><strong>Statistics — per-file and aggregate performance</strong></summary>
+
+![Statistics page](assets/statistics.png)
+
+</details>
+
+<details>
+<summary><strong>Info — live deployment and hardware consumption</strong></summary>
+
+![Info page](assets/info.png)
+
+</details>
+
 ## Quick start
 
 Requirements: Linux, Docker Engine with the Compose plugin, **64 GB RAM**, and enough disk for the **21.35 GB model pair**, build layers and your recordings. Allow **at least 60 GB free** for a new setup; CUDA builds may need more.

@@ -21,7 +21,7 @@ def main():
         page.on('pageerror',lambda error:issues.append(str(error)))
         page.goto(args.base_url)
         page.wait_for_function("() => document.querySelector('#engineLabel').textContent !== 'Connecting…'")
-        assert page.get_by_role('tab').all_text_contents()==['Upload','Files','Player','Statistics','Info']
+        assert [text.strip() for text in page.get_by_role('tab').all_text_contents()]==['Upload','Files','Player','Statistics','Info']
         assert page.locator('#files').get_attribute('accept').startswith('.m4a,.mp4')
         assert page.locator('#submit').is_disabled()
         page.locator('#drop').focus()
