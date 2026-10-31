@@ -155,6 +155,8 @@ def main():
                     else:
                         raise TimeoutError(f'Job {id} exceeded benchmark deadline; it is still queued/running')
                     row = {'file':str(source),'sha256':checksum,'repeat':repeat+1,'job_id':id,
+                           'patch_commit':(readiness.get('telemetry') or {}).get('patch_commit'),
+                           'n_cpu_moe':(readiness.get('telemetry') or {}).get('cpu_moe_blocks'),
                            'backend':readiness['backend'],'runtime_commit':lock['upstream_commit'],
                            'model_revision':lock['model_revision'],'segment_seconds':args.segment_seconds,
                            'upload_queue_job_wall_s':time.perf_counter()-start,'status':status['status'],

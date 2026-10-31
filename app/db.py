@@ -146,3 +146,22 @@ def statistics():
             'inference_rtfx': audio / inference if inference else None,
             'files_per_hour': counts.get('done', 0) * 3600 / wall if wall else None,
             'history': history, 'scope': 'completed_retained_jobs'}
+
+
+def retry_job(id):
+    with connection() as db:
+        db.execute('BEGIN IMMEDIATE')
+        row = db.execute('SELECT * FROM jobs WHERE id=?', (id,)).fetchone()
+        if row is None:
+            return None
+        if row['status'] not in {'failed', 'done'}:
+            raise ValueError('Only failed or completed recordings can be retried')
+        if not Path(row['input_path']).is_file():
+            raise ValueError('The original recording is missing; upload it again')
+        count = db.execute("SELECT count(*) FROM jobs WHERE status IN ('queued','preparing','processing')").fetchone()[0]
+        if count >= int(os.getenv('MAX_PENDING_JOBS', '100')):
+            raise ValueError('Queue is full; wait for processing to finish')
+        db.execute("""UPDATE jobs SET status='queued',error=NULL,progress=0,total_segments=0,
+            completed_segments=0,started_at=NULL,wall_s=NULL,inference_s=NULL,rtfx=NULL,updated_at=?
+            WHERE id=?""", (now(), id))
+        return dict(row)

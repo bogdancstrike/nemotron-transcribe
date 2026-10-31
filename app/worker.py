@@ -25,6 +25,10 @@ NEMO = os.getenv('NEMO_URL', 'http://nemo:8080').rstrip('/')
 OUT = DATA / 'results'
 
 
+class BackendDisconnected(RuntimeError):
+    pass
+
+
 def fmt_time(seconds: float, sep=',') -> str:
     ms = round(float(seconds) * 1000)
     hours, remainder = divmod(ms, 3600000)
@@ -129,7 +133,9 @@ def transcribe_chunk(path: Path, lang: str, diarize: bool) -> dict:
             if not isinstance(result, dict) or not isinstance(result.get('text'), str):
                 raise RuntimeError('Unexpected model response: expected a JSON object with text')
             return result
-        except (httpx.ReadTimeout, httpx.WriteTimeout, httpx.RemoteProtocolError) as exc:
+        except (httpx.ReadError, httpx.RemoteProtocolError) as exc:
+            raise BackendDisconnected('Engine connection was interrupted') from exc
+        except (httpx.ReadTimeout, httpx.WriteTimeout) as exc:
             # The server may still be computing; do not submit a duplicate request.
             raise RuntimeError('Model request interrupted after submission; restart/check engine before retrying this file') from exc
         except (httpx.RequestError, httpx.HTTPStatusError) as exc:
@@ -152,8 +158,11 @@ def model_ready():
         return False
 
 
-def wait_for_model():
+def wait_for_model(timeout=None):
+    deadline = time.monotonic() + timeout if timeout else None
     while not model_ready():
+        if deadline and time.monotonic() >= deadline:
+            raise RuntimeError('Model did not recover in time. Check engine logs, then retry the recording.')
         LOG.info('Waiting for Nemotron engine to load model...')
         time.sleep(10)
 
@@ -179,10 +188,49 @@ def do_job(job: dict):
         chunks = prepare_segments(job['input_path'], Path(temp), job['segment_seconds'])
         update_job(id, status='processing', total_segments=len(chunks), completed_segments=0, progress=0)
         segments, cumulative_offset, inference_s = [], 0.0, 0.0
+        source = Path(job['input_path']).stat()
+        signature = {'size':source.st_size, 'mtime_ns':source.st_mtime_ns,
+                     'language':job['language'], 'diarize':bool(job['diarize']),
+                     'segment_seconds':job['segment_seconds'], 'backend':os.getenv('NEMO_MODE','cpu'),
+                     'patch_commit':os.getenv('NEMO_PATCH_COMMIT','')}
+        checkpoint = outdir / 'checkpoint.json'
+        prior_wall = 0.0
+        try:
+            saved = json.loads(checkpoint.read_text())
+            if saved['signature'] == signature and isinstance(saved['segments'], list) and len(saved['segments']) <= len(chunks):
+                candidate = saved['segments']
+                offset = 0.0
+                for index, segment in enumerate(candidate):
+                    if segment['index'] != index or abs(segment['start_seconds'] - offset) > 1/16000 or abs(segment['duration_s'] - pcm_duration(chunks[index])) > 1/16000:
+                        raise ValueError('Checkpoint does not match PCM segments')
+                    offset += segment['duration_s']
+                segments = candidate
+                cumulative_offset = offset
+                inference_s = sum(segment['inference_s'] for segment in segments)
+                prior_wall = float(saved['wall_s'])
+                LOG.info('Resuming %s after %d completed segments', id, len(segments))
+        except (OSError, ValueError, KeyError, TypeError):
+            LOG.info('No compatible checkpoint for %s; starting at the first segment', id)
+        update_job(id, completed_segments=len(segments), progress=min(99, round(100*len(segments)/len(chunks))))
         for n, path in enumerate(chunks):
+            if n < len(segments):
+                continue
             duration = pcm_duration(path)
             segment_started = time.perf_counter()
-            result = transcribe_chunk(path, job['language'], bool(job['diarize']))
+            for recovery in range(3):
+                try:
+                    result = transcribe_chunk(path, job['language'], bool(job['diarize']))
+                    break
+                except BackendDisconnected as exc:
+                    # Retry only after a real engine outage; an interrupted live engine may
+                    # still be computing and must not receive a duplicate request.
+                    if recovery == 2 or model_ready():
+                        raise RuntimeError('Engine connection interrupted. Check model state, then retry this recording.') from exc
+                    update_job(id, error='Model restarted; waiting to resume the current segment')
+                    wait_for_model(float(os.getenv('ENGINE_RESTART_TIMEOUT_SECONDS','900')))
+                    update_job(id, error=None)
+            else:
+                raise RuntimeError('Model disconnected repeatedly')
             wall = time.perf_counter() - segment_started
             inference_s += wall
             segment = {'index': n, 'start_seconds': cumulative_offset, 'duration_s': duration,
@@ -192,7 +240,8 @@ def do_job(job: dict):
             segment['alignment_valid'] = valid_alignment(segment)
             segments.append(segment)
             cumulative_offset += duration
-            elapsed = time.perf_counter() - started
+            elapsed = prior_wall + time.perf_counter() - started
+            atomic_text(checkpoint, json.dumps({'signature':signature, 'segments':segments, 'wall_s':elapsed}, ensure_ascii=False))
             update_job(id, completed_segments=n + 1, progress=min(99, round(100 * (n + 1) / len(chunks))),
                        wall_s=elapsed, inference_s=inference_s, rtfx=cumulative_offset / elapsed)
         combined = '\n\n'.join(s['text'].strip() for s in segments if s['text'].strip())
@@ -200,7 +249,7 @@ def do_job(job: dict):
         srt = srt_from_segments(segments)
         if srt:
             atomic_text(outdir / 'transcript.srt', srt)
-        wall_s = time.perf_counter() - started
+        wall_s = prior_wall + time.perf_counter() - started
         metadata = {'job_id': id, 'original_filename': job['filename'], 'language_hint': job['language'],
                     'diarization_requested': bool(job['diarize']), 'speaker_scope': 'chunk',
                     'timestamp_source': 'model_word_alignment' if srt else 'unavailable',
@@ -210,6 +259,7 @@ def do_job(job: dict):
                     'backend': os.getenv('NEMO_MODE', 'cpu'),
                     'segments': segments, 'text': combined}
         atomic_text(outdir / 'transcript.json', json.dumps(metadata, ensure_ascii=False, indent=2) + '\n')
+        checkpoint.unlink(missing_ok=True)
         update_job(id, status='done', progress=100, duration_s=cumulative_offset, wall_s=wall_s,
                    inference_s=inference_s, rtfx=metadata['rtfx'])
     LOG.info('Finished job %s', id)

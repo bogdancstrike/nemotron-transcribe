@@ -226,3 +226,14 @@ def media(id: str):
              '.opus':'audio/ogg','.mov':'video/quicktime','.mkv':'video/x-matroska'}
     return FileResponse(path, media_type=types.get(path.suffix.lower(), 'application/octet-stream'),
                         filename=row['filename'], content_disposition_type='inline')
+
+
+@app.post('/api/jobs/{id}/retry', status_code=202)
+def retry(id: str):
+    try:
+        row = db.retry_job(id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if row is None:
+        raise HTTPException(404, 'Job not found')
+    return {'id':id, 'status':'queued'}

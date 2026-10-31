@@ -28,6 +28,11 @@ def cpu_ticks():
     return sum(values), values[3] + values[4]
 
 
+def model_cpu_ticks():
+    fields = Path('/proc/1/stat').read_text().rsplit(')', 1)[1].split()
+    return int(fields[11]) + int(fields[12])
+
+
 def model_rss():
     for line in Path('/proc/1/status').read_text().splitlines():
         if line.startswith('VmRSS:'):
@@ -55,12 +60,17 @@ def main():
     DATA.mkdir(parents=True, exist_ok=True)
     brand = next((line.split(':',1)[1].strip() for line in Path('/proc/cpuinfo').read_text().splitlines() if line.startswith('model name')), 'Unknown CPU')
     previous = cpu_ticks()
+    previous_process, previous_time = model_cpu_ticks(), time.monotonic()
     while True:
+        process_ticks, sampled_time = model_cpu_ticks(), time.monotonic()
+        elapsed = sampled_time - previous_time
+        process_cores = (process_ticks - previous_process) / os.sysconf('SC_CLK_TCK') / elapsed if elapsed else 0
+        previous_process, previous_time = process_ticks, sampled_time
         current = cpu_ticks()
         delta = current[0] - previous[0]
         usage = 100 * (1 - (current[1] - previous[1]) / delta) if delta else None
         previous = current
-        result = {'sampled_at':datetime.now(timezone.utc).isoformat(), 'cpu':{'name':brand,'logical_cores':os.cpu_count(),'utilization_percent':usage},
+        result = {'sampled_at':datetime.now(timezone.utc).isoformat(), 'cpu':{'name':brand,'logical_cores':os.cpu_count(),'utilization_percent':usage, 'engine_cpu_cores':process_cores},
                   'ram':meminfo(),'engine_rss_mib':model_rss(),'gpu':gpu_info(),
                   'disk_free_gib':shutil.disk_usage(DATA).free / 1024**3,
                   'backend':os.getenv('NEMO_MODE','cpu'),

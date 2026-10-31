@@ -1,112 +1,1005 @@
-'use strict';
-const $ = selector => document.querySelector(selector);
-const ui = {chosen: [], jobs: [], filter: 'all', uploading: false, lastJobs: '', deleting: null, transcript: ''};
-const active = job => ['queued', 'preparing', 'processing'].includes(job.status);
-const node = (tag, cls, value) => { const n = document.createElement(tag); if (cls) n.className = cls; if (value !== undefined) n.textContent = value; return n; };
-const duration = seconds => { if (seconds === null || seconds === undefined || !Number.isFinite(seconds)) return '—'; seconds = Math.max(0, Math.round(seconds)); if (seconds < 60) return `${seconds}s`; const m = Math.floor(seconds / 60), s = seconds % 60; return m < 60 ? `${m}m ${String(s).padStart(2, '0')}s` : `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`; };
-const speed = value => Number.isFinite(value) && value > 0 ? `${value.toFixed(2)}×` : '—';
-const factor = value => Number.isFinite(value) && value > 0 ? value.toFixed(2) : '—';
-const bytes = value => value >= 1024 ** 3 ? `${(value / 1024 ** 3).toFixed(1)} GB` : `${(value / 1024 ** 2).toFixed(1)} MB`;
-const endpoint = (id, format) => `/api/jobs/${encodeURIComponent(id)}/download/${format}`;
-async function api(url, options = {}) { const r = await fetch(url, {...options, signal: AbortSignal.timeout(15000)}); if (!r.ok) { let detail = `HTTP ${r.status}`; try { detail = (await r.json()).detail || detail; } catch {} throw Error(detail); } return r.status === 204 ? null : r.json(); }
-function feedback(text, error = false) { $('#message').textContent = text; $('#message').className = `feedback ${error ? 'error' : 'success'}`; }
-function selectFiles(files) { if (ui.uploading) return; ui.chosen = Array.from(files); renderSelected(); }
-function renderSelected() { const holder = $('#selectedFiles'); holder.replaceChildren(); ui.chosen.forEach((file, i) => { const row = node('div', 'selected-file'); row.append(node('span', '', file.name), node('small', '', bytes(file.size))); const remove = node('button', '', '×'); remove.type = 'button'; remove.setAttribute('aria-label', `Remove ${file.name} from selection`); remove.disabled = ui.uploading; remove.addEventListener('click', () => {ui.chosen.splice(i, 1); renderSelected();}); row.append(remove); holder.append(row); }); $('#submit').disabled = ui.uploading || !ui.chosen.length; $('#files').disabled = ui.uploading; }
-$('#files').addEventListener('change', e => selectFiles(e.target.files));
-$('#drop').addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') {e.preventDefault(); if (!ui.uploading) $('#files').click();} });
-for (const event of ['dragenter', 'dragover']) $('#drop').addEventListener(event, e => {e.preventDefault(); $('#drop').classList.add('drag');});
-for (const event of ['dragleave', 'drop']) $('#drop').addEventListener(event, e => {e.preventDefault(); $('#drop').classList.remove('drag');});
-$('#drop').addEventListener('drop', e => selectFiles(e.dataTransfer.files));
-function upload(file, settings, position, total) { return new Promise((resolve, reject) => { const xhr = new XMLHttpRequest(), form = new FormData(); form.append('file', file); for (const [key, value] of Object.entries(settings)) form.append(key, value); xhr.open('POST', '/api/jobs'); xhr.timeout = 30 * 60 * 1000; xhr.upload.onprogress = e => { if (e.lengthComputable) {const percent = Math.round(e.loaded / e.total * 100); $('#uploadBar').value = percent; $('#uploadPercent').textContent = `${percent}%`; $('#uploadLabel').textContent = percent === 100 ? 'Checking audio…' : `${position}/${total} · ${file.name}`;}}; xhr.onload = () => {if (xhr.status >= 200 && xhr.status < 300) resolve(JSON.parse(xhr.responseText)); else {let detail = `HTTP ${xhr.status}`; try {detail = JSON.parse(xhr.responseText).detail || detail;} catch {} reject(Error(detail));}}; xhr.onerror = () => reject(Error('Connection lost during upload')); xhr.ontimeout = () => reject(Error('Upload timed out')); xhr.send(form); }); }
-$('#submit').addEventListener('click', async () => { if (ui.uploading || !ui.chosen.length) return; const files = [...ui.chosen], failed = [], settings = {language: $('#language').value, segment_seconds: $('#duration').value, diarize: String($('#diarize').checked)}; ui.uploading = true; renderSelected(); $('#uploadProgress').hidden = false; let succeeded = 0, uploadedId = null; for (const [i, file] of files.entries()) {$('#uploadBar').value = 0; $('#uploadPercent').textContent = '0%'; $('#uploadLabel').textContent = `${i + 1}/${files.length} · ${file.name}`; try {const created = await upload(file, settings, i + 1, files.length); uploadedId = created.id; succeeded++; await refresh();} catch (e) {failed.push({file, error: e.message});}} ui.uploading = false; ui.chosen = failed.map(f => f.file); $('#files').value = ''; $('#uploadProgress').hidden = true; renderSelected(); feedback(`${succeeded} recording${succeeded === 1 ? '' : 's'} queued.${failed.length ? ' ' + failed.map(f => `${f.file.name}: ${f.error}`).join('; ') : ' You can add more files while these process.'}`, !!failed.length); await refresh(); if (uploadedId) {switchTab('files'); const card = document.querySelector(`[data-job-id="${uploadedId}"]`); if (card) {card.classList.add('recent-upload'); card.tabIndex = -1; card.focus({preventScroll: true}); card.scrollIntoView({block:'center',behavior:window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth'});}} });
-function stat(label, value, cls = '') { const item = node('div', `job-stat ${cls}`); item.append(node('span', '', label), node('b', '', value)); return item; }
-function elapsed(job) { if (['processing', 'preparing'].includes(job.status) && job.started_at) return Math.max(0, (Date.now() - Date.parse(job.started_at)) / 1000); return job.wall_s; }
-function renderJobs() { const holder = $('#jobs'), query = $('#search').value.trim().toLocaleLowerCase(), jobs = ui.jobs.filter(j => (ui.filter === 'all' || (ui.filter === 'active' ? active(j) : j.status === ui.filter)) && j.filename.toLocaleLowerCase().includes(query)); $('#queueCount').textContent = ui.jobs.length; holder.replaceChildren(); if (!jobs.length) {const empty = node('div', 'empty-state'); const wave = node('div', 'empty-wave'); wave.setAttribute('aria-hidden', 'true'); for(let i = 0; i < 9; i++) wave.append(node('i')); empty.append(wave, node('h3', '', ui.jobs.length ? 'No matching files' : 'No files yet'), node('p', '', ui.jobs.length ? 'Try another filter or search.' : 'Add an M4A or MP4 recording to get started.'), node('span', 'empty-label', 'READY WHEN YOU ARE')); holder.append(empty); return; }
- for (const job of jobs) { const card = node('article', `job ${job.status}`); card.dataset.jobId = job.id; const head = node('div', 'job-head'), icon = node('div', 'file-icon', job.filename.split('.').pop().toUpperCase().slice(0, 5)), nameWrap = node('div', 'job-name-wrap'), subtitle = node('div', 'job-subtitle'); subtitle.append(node('span', '', duration(job.duration_s)), node('span', '', job.language === 'auto' ? 'AUTO' : job.language.toUpperCase()), node('span', '', new Date(job.created_at).toLocaleString(undefined, {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'}))); nameWrap.append(node('h3', 'job-name', job.filename), subtitle); head.append(icon, nameWrap, node('span', `status ${job.status}`, {done:'Completed', preparing:'Preparing', processing:'Transcribing', queued:'Queued', failed:'Failed'}[job.status] || job.status)); card.append(head);
- if (active(job)) {const box = node('div', 'job-progress'), bar = node('progress'); bar.max = 100; bar.value = Math.max(0, Math.min(100, job.progress)); bar.setAttribute('aria-label', `${job.filename} transcription progress`); const label = node('div', 'job-progress-label'); label.append(node('span', '', job.status === 'queued' ? 'Waiting for the engine / previous file' : job.status === 'preparing' ? 'Preparing audio for the model' : `${job.completed_segments} of ${job.total_segments} segments complete`), node('strong', '', `${job.progress}%`)); box.append(bar, label); card.append(box); }
- if (job.status !== 'queued') {const stats = node('div', 'job-stats'); const timeStat = stat(['processing','preparing'].includes(job.status) ? 'Elapsed' : 'Processing time', duration(elapsed(job))); if (active(job)) timeStat.querySelector('b').dataset.elapsedId = job.id; stats.append(timeStat, stat(active(job) ? 'Speed · provisional' : 'Speed · RTFx', speed(job.rtfx), 'speed'), stat('Real-time factor', job.rtfx ? factor(1 / job.rtfx) : '—'), stat('Inference time', duration(job.inference_s))); card.append(stats); }
- if (job.error) card.append(node('p', 'job-error', job.error)); const actions = node('div', 'job-actions'), links = node('div', 'download-links'); if (job.status === 'done') { const preview = node('button', 'secondary preview-button', 'Open player'); preview.addEventListener('click', () => showPlayer(job)); links.append(preview); for (const format of job.srt_available ? ['txt','json','srt'] : ['txt','json']) {const link = node('a', 'download-link', `${format.toUpperCase()} ↓`); link.href = endpoint(job.id, format); link.setAttribute('aria-label', `Download ${format.toUpperCase()} for ${job.filename}`); links.append(link);} } actions.append(links); if (!['preparing','processing'].includes(job.status)) {const remove = node('button', 'job-delete', 'Delete'); remove.setAttribute('aria-label', `Delete ${job.filename}`); remove.addEventListener('click', () => {ui.deleting = job; $('#deleteFilename').textContent = job.filename; $('#deleteDialog').showModal();}); actions.append(remove);} if (links.childNodes.length || actions.childNodes.length > 1) card.append(actions); if (job.status === 'done' && !job.srt_available) card.append(node('p', 'srt-note', 'Subtitles unavailable: complete word alignment was not returned.')); holder.append(card); }
+"use strict";
+const $ = (selector) => document.querySelector(selector);
+const ui = {
+  chosen: [],
+  jobs: [],
+  filter: "all",
+  uploading: false,
+  lastJobs: "",
+  deleting: null,
+  transcript: "",
+};
+const active = (job) =>
+  ["queued", "preparing", "processing"].includes(job.status);
+const node = (tag, cls, value) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (value !== undefined) n.textContent = value;
+  return n;
+};
+const duration = (seconds) => {
+  if (seconds === null || seconds === undefined || !Number.isFinite(seconds))
+    return "—";
+  seconds = Math.max(0, Math.round(seconds));
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60),
+    s = seconds % 60;
+  return m < 60
+    ? `${m}m ${String(s).padStart(2, "0")}s`
+    : `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
+};
+const speed = (value) =>
+  Number.isFinite(value) && value > 0 ? `${value.toFixed(2)}×` : "—";
+const factor = (value) =>
+  Number.isFinite(value) && value > 0 ? value.toFixed(2) : "—";
+const bytes = (value) =>
+  value >= 1024 ** 3
+    ? `${(value / 1024 ** 3).toFixed(1)} GB`
+    : `${(value / 1024 ** 2).toFixed(1)} MB`;
+const endpoint = (id, format) =>
+  `/api/jobs/${encodeURIComponent(id)}/download/${format}`;
+async function api(url, options = {}) {
+  const r = await fetch(url, {
+    ...options,
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!r.ok) {
+    let detail = `HTTP ${r.status}`;
+    try {
+      detail = (await r.json()).detail || detail;
+    } catch {}
+    throw Error(detail);
+  }
+  return r.status === 204 ? null : r.json();
 }
-function renderHistory(history) {const container = $('#history'); container.replaceChildren(); const today = new Date(), days = Array.from({length:7}, (_, i) => {const date = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() - 6 + i)); const day = date.toISOString().slice(0,10); return {date, day, seconds: history.find(x => x.day === day)?.audio_s || 0};}); const max = Math.max(1, ...days.map(d => d.seconds)); for (const d of days) {const col = node('div', 'history-day'), bar = node('div', 'history-bar'); bar.style.height = `${Math.max(2, d.seconds / max * 64)}px`; col.title = `${d.day}: ${duration(d.seconds)} completed`; bar.setAttribute('aria-label', col.title); col.append(bar, node('span', '', d.date.toLocaleDateString(undefined, {weekday:'short', timeZone:'UTC'}).slice(0,2))); container.append(col);} }
-function renderStats(stats) {$('#audioTotal').textContent = duration(stats.audio_s); $('#wallTotal').textContent = duration(stats.wall_s); $('#speedTotal').textContent = speed(stats.rtfx); $('#rtfTotal').textContent = factor(stats.rtf); const count = stats.counts.done || 0; $('#fileTotal').textContent = `${count} completed file${count === 1 ? '' : 's'} · ${stats.counts.failed || 0} failed`; $('#speedHint').textContent = stats.rtfx ? `${(stats.rtfx * 60).toFixed(1)} audio min / processing hour` : 'Measured after your first transcription'; renderHistory(stats.history); const running = ui.jobs.find(j => ['preparing','processing'].includes(j.status)), pending = ui.jobs.filter(j => j.status === 'queued').length; $('#queueSummary').hidden = !running && !pending; $('#activeSummary').textContent = running ? `Working on ${running.filename}` : 'Queue is waiting for the model'; $('#pendingSummary').textContent = `${pending} waiting`; }
-async function showPreview(job) {$('#previewTitle').textContent = job.filename; $('#previewText').textContent = 'Loading transcript…'; $('#copyStatus').textContent = ''; $('#copyTranscript').disabled = true; $('#previewMeta').textContent = `${duration(job.duration_s)} audio · ${speed(job.rtfx)} throughput · ${job.rtfx ? factor(1 / job.rtfx) : '—'} RTF`; $('#previewDownload').href = endpoint(job.id, 'txt'); $('#preview').showModal(); try {const result = await api(endpoint(job.id, 'json')); ui.transcript = result.text || ''; $('#previewText').textContent = ui.transcript || 'No speech detected in this recording.'; $('#copyTranscript').disabled = !ui.transcript;} catch(e) {$('#previewText').textContent = `Could not load transcript: ${e.message}`;} }
-$('#closePreview').addEventListener('click', () => $('#preview').close());
-$('#copyTranscript').addEventListener('click', async () => {try {await navigator.clipboard.writeText(ui.transcript); $('#copyStatus').textContent = 'Copied to clipboard';} catch {$('#copyStatus').textContent = 'Clipboard unavailable. Select and copy the text.';}});
-for (const id of ['closeDelete','cancelDelete']) $(`#${id}`).addEventListener('click', () => $('#deleteDialog').close());
-$('#confirmDelete').addEventListener('click', async () => {if (!ui.deleting) return; $('#confirmDelete').disabled = true; try {await api(`/api/jobs/${encodeURIComponent(ui.deleting.id)}`, {method:'DELETE'}); $('#deleteDialog').close(); feedback('Recording deleted.'); await refresh();} catch(e) {feedback(e.message, true); $('#deleteDialog').close();} finally {$('#confirmDelete').disabled = false; ui.deleting = null;} });
-for (const button of document.querySelectorAll('.filter')) button.addEventListener('click', () => {ui.filter = button.dataset.filter; for (const b of document.querySelectorAll('.filter')) {b.classList.toggle('active', b === button); b.setAttribute('aria-pressed', String(b === button));} renderJobs();});
-$('#search').addEventListener('input', renderJobs);
+function feedback(text, error = false) {
+  $("#message").textContent = text;
+  $("#message").className = `feedback ${error ? "error" : "success"}`;
+}
+function selectFiles(files) {
+  if (ui.uploading) return;
+  ui.chosen = Array.from(files);
+  renderSelected();
+}
+function renderSelected() {
+  const holder = $("#selectedFiles");
+  holder.replaceChildren();
+  ui.chosen.forEach((file, i) => {
+    const row = node("div", "selected-file");
+    row.append(
+      node("span", "", file.name),
+      node("small", "", bytes(file.size)),
+    );
+    const remove = node("button", "", "×");
+    remove.type = "button";
+    remove.setAttribute("aria-label", `Remove ${file.name} from selection`);
+    remove.disabled = ui.uploading;
+    remove.addEventListener("click", () => {
+      ui.chosen.splice(i, 1);
+      renderSelected();
+    });
+    row.append(remove);
+    holder.append(row);
+  });
+  $("#submit").disabled = ui.uploading || !ui.chosen.length;
+  $("#files").disabled = ui.uploading;
+}
+$("#files").addEventListener("change", (e) => selectFiles(e.target.files));
+$("#drop").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === " ") {
+    e.preventDefault();
+    if (!ui.uploading) $("#files").click();
+  }
+});
+for (const event of ["dragenter", "dragover"])
+  $("#drop").addEventListener(event, (e) => {
+    e.preventDefault();
+    $("#drop").classList.add("drag");
+  });
+for (const event of ["dragleave", "drop"])
+  $("#drop").addEventListener(event, (e) => {
+    e.preventDefault();
+    $("#drop").classList.remove("drag");
+  });
+$("#drop").addEventListener("drop", (e) => selectFiles(e.dataTransfer.files));
+function upload(file, settings, position, total) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest(),
+      form = new FormData();
+    form.append("file", file);
+    for (const [key, value] of Object.entries(settings))
+      form.append(key, value);
+    xhr.open("POST", "/api/jobs");
+    xhr.timeout = 30 * 60 * 1000;
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        const percent = Math.round((e.loaded / e.total) * 100);
+        $("#uploadBar").value = percent;
+        $("#uploadPercent").textContent = `${percent}%`;
+        $("#uploadLabel").textContent =
+          percent === 100
+            ? "Checking audio…"
+            : `${position}/${total} · ${file.name}`;
+      }
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300)
+        resolve(JSON.parse(xhr.responseText));
+      else {
+        let detail = `HTTP ${xhr.status}`;
+        try {
+          detail = JSON.parse(xhr.responseText).detail || detail;
+        } catch {}
+        reject(Error(detail));
+      }
+    };
+    xhr.onerror = () => reject(Error("Connection lost during upload"));
+    xhr.ontimeout = () => reject(Error("Upload timed out"));
+    xhr.send(form);
+  });
+}
+$("#submit").addEventListener("click", async () => {
+  if (ui.uploading || !ui.chosen.length) return;
+  const files = [...ui.chosen],
+    failed = [],
+    settings = {
+      language: $("#language").value,
+      segment_seconds: $("#duration").value,
+      diarize: String($("#diarize").checked),
+    };
+  ui.uploading = true;
+  renderSelected();
+  $("#uploadProgress").hidden = false;
+  let succeeded = 0,
+    uploadedId = null;
+  for (const [i, file] of files.entries()) {
+    $("#uploadBar").value = 0;
+    $("#uploadPercent").textContent = "0%";
+    $("#uploadLabel").textContent = `${i + 1}/${files.length} · ${file.name}`;
+    try {
+      const created = await upload(file, settings, i + 1, files.length);
+      uploadedId = created.id;
+      succeeded++;
+      await refresh();
+    } catch (e) {
+      failed.push({ file, error: e.message });
+    }
+  }
+  ui.uploading = false;
+  ui.chosen = failed.map((f) => f.file);
+  $("#files").value = "";
+  $("#uploadProgress").hidden = true;
+  renderSelected();
+  feedback(
+    `${succeeded} recording${succeeded === 1 ? "" : "s"} queued.${failed.length ? " " + failed.map((f) => `${f.file.name}: ${f.error}`).join("; ") : " You can add more files while these process."}`,
+    !!failed.length,
+  );
+  await refresh();
+  if (uploadedId) {
+    switchTab("files");
+    const card = document.querySelector(`[data-job-id="${uploadedId}"]`);
+    if (card) {
+      card.classList.add("recent-upload");
+      card.tabIndex = -1;
+      card.focus({ preventScroll: true });
+      card.scrollIntoView({
+        block: "center",
+        behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+          ? "instant"
+          : "smooth",
+      });
+    }
+  }
+});
+function stat(label, value, cls = "") {
+  const item = node("div", `job-stat ${cls}`);
+  item.append(node("span", "", label), node("b", "", value));
+  return item;
+}
+function elapsed(job) {
+  if (["processing", "preparing"].includes(job.status) && job.started_at)
+    return Math.max(0, (Date.now() - Date.parse(job.started_at)) / 1000);
+  return job.wall_s;
+}
+function renderJobs() {
+  const holder = $("#jobs"),
+    query = $("#search").value.trim().toLocaleLowerCase(),
+    jobs = ui.jobs.filter(
+      (j) =>
+        (ui.filter === "all" ||
+          (ui.filter === "active" ? active(j) : j.status === ui.filter)) &&
+        j.filename.toLocaleLowerCase().includes(query),
+    );
+  $("#queueCount").textContent = ui.jobs.length;
+  holder.replaceChildren();
+  if (!jobs.length) {
+    const empty = node("div", "empty-state");
+    const wave = node("div", "empty-wave");
+    wave.setAttribute("aria-hidden", "true");
+    for (let i = 0; i < 9; i++) wave.append(node("i"));
+    empty.append(
+      wave,
+      node("h3", "", ui.jobs.length ? "No matching files" : "No files yet"),
+      node(
+        "p",
+        "",
+        ui.jobs.length
+          ? "Try another filter or search."
+          : "Add an M4A or MP4 recording to get started.",
+      ),
+      node("span", "empty-label", "READY WHEN YOU ARE"),
+    );
+    holder.append(empty);
+    return;
+  }
+  for (const job of jobs) {
+    const card = node("article", `job ${job.status}`);
+    card.dataset.jobId = job.id;
+    const head = node("div", "job-head"),
+      icon = node(
+        "div",
+        "file-icon",
+        job.filename.split(".").pop().toUpperCase().slice(0, 5),
+      ),
+      nameWrap = node("div", "job-name-wrap"),
+      subtitle = node("div", "job-subtitle");
+    subtitle.append(
+      node("span", "", duration(job.duration_s)),
+      node(
+        "span",
+        "",
+        job.language === "auto" ? "AUTO" : job.language.toUpperCase(),
+      ),
+      node(
+        "span",
+        "",
+        new Date(job.created_at).toLocaleString(undefined, {
+          month: "short",
+          day: "numeric",
+          hour: "2-digit",
+          minute: "2-digit",
+        }),
+      ),
+    );
+    nameWrap.append(node("h3", "job-name", job.filename), subtitle);
+    head.append(
+      icon,
+      nameWrap,
+      node(
+        "span",
+        `status ${job.status}`,
+        {
+          done: "Completed",
+          preparing: "Preparing",
+          processing: "Transcribing",
+          queued: "Queued",
+          failed: "Failed",
+        }[job.status] || job.status,
+      ),
+    );
+    card.append(head);
+    if (active(job)) {
+      const box = node("div", "job-progress"),
+        bar = node("progress");
+      bar.max = 100;
+      bar.value = Math.max(0, Math.min(100, job.progress));
+      bar.setAttribute("aria-label", `${job.filename} transcription progress`);
+      const label = node("div", "job-progress-label");
+      label.append(
+        node(
+          "span",
+          "",
+          job.status === "queued"
+            ? "Waiting for the engine / previous file"
+            : job.status === "preparing"
+              ? "Preparing audio for the model"
+              : `${job.completed_segments} of ${job.total_segments} segments complete`,
+        ),
+        node("strong", "", `${job.progress}%`),
+      );
+      box.append(bar, label);
+      card.append(box);
+    }
+    if (job.status !== "queued") {
+      const stats = node("div", "job-stats");
+      const timeStat = stat(
+        ["processing", "preparing"].includes(job.status)
+          ? "Elapsed"
+          : "Processing time",
+        duration(elapsed(job)),
+      );
+      if (active(job)) timeStat.querySelector("b").dataset.elapsedId = job.id;
+      stats.append(
+        timeStat,
+        stat(
+          active(job) ? "Speed · provisional" : "Speed · RTFx",
+          speed(job.rtfx),
+          "speed",
+        ),
+        stat("Real-time factor", job.rtfx ? factor(1 / job.rtfx) : "—"),
+        stat("Inference time", duration(job.inference_s)),
+      );
+      card.append(stats);
+    }
+    if (job.error) card.append(node("p", "job-error", job.error));
+    const actions = node("div", "job-actions"),
+      links = node("div", "download-links");
+    if (job.status === "done") {
+      const preview = node("button", "secondary preview-button", "Open player");
+      preview.addEventListener("click", () => showPlayer(job));
+      links.append(preview);
+      for (const format of job.srt_available
+        ? ["txt", "json", "srt"]
+        : ["txt", "json"]) {
+        const link = node("a", "download-link", `${format.toUpperCase()} ↓`);
+        link.href = endpoint(job.id, format);
+        link.setAttribute(
+          "aria-label",
+          `Download ${format.toUpperCase()} for ${job.filename}`,
+        );
+        links.append(link);
+      }
+    }
+    actions.append(links);
+    if (["failed", "done"].includes(job.status)) {
+      const retry = node("button", "secondary", "Retry");
+      retry.addEventListener("click", async () => {
+        retry.disabled = true;
+        try {
+          await api(`/api/jobs/${encodeURIComponent(job.id)}/retry`, {
+            method: "POST",
+          });
+          feedback(
+            "Recording queued. Completed segments will resume when compatible.",
+          );
+          await refresh();
+        } catch (e) {
+          feedback(e.message, true);
+          retry.disabled = false;
+        }
+      });
+      links.append(retry);
+    }
+    if (!["preparing", "processing"].includes(job.status)) {
+      const remove = node("button", "job-delete", "Delete");
+      remove.setAttribute("aria-label", `Delete ${job.filename}`);
+      remove.addEventListener("click", () => {
+        ui.deleting = job;
+        $("#deleteFilename").textContent = job.filename;
+        $("#deleteDialog").showModal();
+      });
+      actions.append(remove);
+    }
+    if (links.childNodes.length || actions.childNodes.length > 1)
+      card.append(actions);
+    if (job.status === "done" && !job.srt_available)
+      card.append(
+        node(
+          "p",
+          "srt-note",
+          "Subtitles unavailable: complete word alignment was not returned.",
+        ),
+      );
+    holder.append(card);
+  }
+}
+function renderHistory(history) {
+  const container = $("#history");
+  container.replaceChildren();
+  const today = new Date(),
+    days = Array.from({ length: 7 }, (_, i) => {
+      const date = new Date(
+        Date.UTC(
+          today.getUTCFullYear(),
+          today.getUTCMonth(),
+          today.getUTCDate() - 6 + i,
+        ),
+      );
+      const day = date.toISOString().slice(0, 10);
+      return {
+        date,
+        day,
+        seconds: history.find((x) => x.day === day)?.audio_s || 0,
+      };
+    });
+  const max = Math.max(1, ...days.map((d) => d.seconds));
+  for (const d of days) {
+    const col = node("div", "history-day"),
+      bar = node("div", "history-bar");
+    bar.style.height = `${Math.max(2, (d.seconds / max) * 64)}px`;
+    col.title = `${d.day}: ${duration(d.seconds)} completed`;
+    bar.setAttribute("aria-label", col.title);
+    col.append(
+      bar,
+      node(
+        "span",
+        "",
+        d.date
+          .toLocaleDateString(undefined, { weekday: "short", timeZone: "UTC" })
+          .slice(0, 2),
+      ),
+    );
+    container.append(col);
+  }
+}
+function renderStats(stats) {
+  $("#audioTotal").textContent = duration(stats.audio_s);
+  $("#wallTotal").textContent = duration(stats.wall_s);
+  $("#speedTotal").textContent = speed(stats.rtfx);
+  $("#rtfTotal").textContent = factor(stats.rtf);
+  const count = stats.counts.done || 0;
+  $("#fileTotal").textContent =
+    `${count} completed file${count === 1 ? "" : "s"} · ${stats.counts.failed || 0} failed`;
+  $("#speedHint").textContent = stats.rtfx
+    ? `${(stats.rtfx * 60).toFixed(1)} audio min / processing hour`
+    : "Measured after your first transcription";
+  renderHistory(stats.history);
+  const running = ui.jobs.find((j) =>
+      ["preparing", "processing"].includes(j.status),
+    ),
+    pending = ui.jobs.filter((j) => j.status === "queued").length;
+  $("#queueSummary").hidden = !running && !pending;
+  $("#activeSummary").textContent = running
+    ? `Working on ${running.filename}`
+    : "Queue is waiting for the model";
+  $("#pendingSummary").textContent = `${pending} waiting`;
+}
+async function showPreview(job) {
+  $("#previewTitle").textContent = job.filename;
+  $("#previewText").textContent = "Loading transcript…";
+  $("#copyStatus").textContent = "";
+  $("#copyTranscript").disabled = true;
+  $("#previewMeta").textContent =
+    `${duration(job.duration_s)} audio · ${speed(job.rtfx)} throughput · ${job.rtfx ? factor(1 / job.rtfx) : "—"} RTF`;
+  $("#previewDownload").href = endpoint(job.id, "txt");
+  $("#preview").showModal();
+  try {
+    const result = await api(endpoint(job.id, "json"));
+    ui.transcript = result.text || "";
+    $("#previewText").textContent =
+      ui.transcript || "No speech detected in this recording.";
+    $("#copyTranscript").disabled = !ui.transcript;
+  } catch (e) {
+    $("#previewText").textContent = `Could not load transcript: ${e.message}`;
+  }
+}
+$("#closePreview").addEventListener("click", () => $("#preview").close());
+$("#copyTranscript").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(ui.transcript);
+    $("#copyStatus").textContent = "Copied to clipboard";
+  } catch {
+    $("#copyStatus").textContent =
+      "Clipboard unavailable. Select and copy the text.";
+  }
+});
+for (const id of ["closeDelete", "cancelDelete"])
+  $(`#${id}`).addEventListener("click", () => $("#deleteDialog").close());
+$("#confirmDelete").addEventListener("click", async () => {
+  if (!ui.deleting) return;
+  $("#confirmDelete").disabled = true;
+  try {
+    await api(`/api/jobs/${encodeURIComponent(ui.deleting.id)}`, {
+      method: "DELETE",
+    });
+    $("#deleteDialog").close();
+    feedback("Recording deleted.");
+    await refresh();
+  } catch (e) {
+    feedback(e.message, true);
+    $("#deleteDialog").close();
+  } finally {
+    $("#confirmDelete").disabled = false;
+    ui.deleting = null;
+  }
+});
+for (const button of document.querySelectorAll(".filter"))
+  button.addEventListener("click", () => {
+    ui.filter = button.dataset.filter;
+    for (const b of document.querySelectorAll(".filter")) {
+      b.classList.toggle("active", b === button);
+      b.setAttribute("aria-pressed", String(b === button));
+    }
+    renderJobs();
+  });
+$("#search").addEventListener("input", renderJobs);
 let refreshing = false;
-async function refresh() {if (refreshing) return; refreshing = true; try {const [jobs, stats] = await Promise.all([api('/api/jobs'), api('/api/stats')]); ui.jobs = jobs.jobs; const snapshot = JSON.stringify(ui.jobs); if (snapshot !== ui.lastJobs) {ui.lastJobs = snapshot; renderJobs();} renderStats(stats); renderFileStatistics(); $('#refreshStatus').textContent = '● LIVE UPDATES';} catch {$('#refreshStatus').textContent = 'RECONNECTING…';} finally {refreshing = false;} }
-async function refreshEngine() {try {const info = await api('/api/system'); renderInfo(info); $('#engine').classList.toggle('ready', info.engine_ready); $('#engineLabel').textContent = info.engine_ready ? 'Model ready' : 'Model loading / unavailable'; $('#backendLabel').textContent = info.backend === 'hybrid' ? 'GPU + RAM · HYBRID' : 'CPU · RAM'; $('#uploadLimit').textContent = `Up to ${info.max_upload_mb >= 1024 ? `${(info.max_upload_mb / 1024).toFixed(0)} GB` : `${info.max_upload_mb} MB`} per file`; $('#storage').textContent = `${info.disk_free_gib.toFixed(1)} GiB free on disk`; $('#retention').textContent = info.retention_days ? `Completed files retained for ${info.retention_days} days.` : 'Files stay here until you delete them.';} catch {$('#engineLabel').textContent = 'Studio disconnected'; $('#engine').classList.remove('ready');} }
-setInterval(() => {for (const n of document.querySelectorAll('[data-elapsed-id]')) {const job = ui.jobs.find(j => j.id === n.dataset.elapsedId); if(job) n.textContent = duration(elapsed(job));}}, 1000);
-refresh(); refreshEngine(); setInterval(refresh, 2500); setInterval(refreshEngine, 8000);
+async function refresh() {
+  if (refreshing) return;
+  refreshing = true;
+  try {
+    const [jobs, stats] = await Promise.all([
+      api("/api/jobs"),
+      api("/api/stats"),
+    ]);
+    ui.jobs = jobs.jobs;
+    const snapshot = JSON.stringify(ui.jobs);
+    if (snapshot !== ui.lastJobs) {
+      ui.lastJobs = snapshot;
+      renderJobs();
+    }
+    renderStats(stats);
+    renderFileStatistics();
+    $("#refreshStatus").textContent = "● LIVE UPDATES";
+  } catch {
+    $("#refreshStatus").textContent = "RECONNECTING…";
+  } finally {
+    refreshing = false;
+  }
+}
+async function refreshEngine() {
+  try {
+    const info = await api("/api/system");
+    renderInfo(info);
+    $("#engine").classList.toggle("ready", info.engine_ready);
+    $("#engineLabel").textContent = info.engine_ready
+      ? "Model ready"
+      : "Model loading / unavailable";
+    $("#backendLabel").textContent =
+      info.backend === "hybrid" ? "GPU + RAM · HYBRID" : "CPU · RAM";
+    $("#uploadLimit").textContent =
+      `Up to ${info.max_upload_mb >= 1024 ? `${(info.max_upload_mb / 1024).toFixed(0)} GB` : `${info.max_upload_mb} MB`} per file`;
+    $("#storage").textContent =
+      `${info.disk_free_gib.toFixed(1)} GiB free on disk`;
+    $("#retention").textContent = info.retention_days
+      ? `Completed files retained for ${info.retention_days} days.`
+      : "Files stay here until you delete them.";
+  } catch {
+    $("#engineLabel").textContent = "Studio disconnected";
+    $("#engine").classList.remove("ready");
+  }
+}
+setInterval(() => {
+  for (const n of document.querySelectorAll("[data-elapsed-id]")) {
+    const job = ui.jobs.find((j) => j.id === n.dataset.elapsedId);
+    if (job) n.textContent = duration(elapsed(job));
+  }
+}, 1000);
+refresh();
+refreshEngine();
+setInterval(refresh, 2500);
+setInterval(refreshEngine, 8000);
 
 // Tabs keep the file queue, synchronized player and performance readout separate.
 function switchTab(name) {
- for (const button of document.querySelectorAll('[data-tab]')) {const selected = button.dataset.tab === name; button.setAttribute('aria-selected', String(selected)); button.tabIndex = selected ? 0 : -1;}
- for (const panel of document.querySelectorAll('.tab-panel')) panel.hidden = panel.id !== `${name}Tab`;
+  for (const button of document.querySelectorAll("[data-tab]")) {
+    const selected = button.dataset.tab === name;
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+  }
+  for (const panel of document.querySelectorAll(".tab-panel"))
+    panel.hidden = panel.id !== `${name}Tab`;
 }
-for (const button of document.querySelectorAll('[data-tab]')) {
- button.addEventListener('click', () => switchTab(button.dataset.tab));
- button.addEventListener('keydown', e => {if (!['ArrowLeft','ArrowRight','Home','End'].includes(e.key)) return; e.preventDefault(); const tabs = [...document.querySelectorAll('[data-tab]')], index = tabs.indexOf(button), next = e.key === 'Home' ? 0 : e.key === 'End' ? tabs.length - 1 : (index + (e.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length; tabs[next].focus(); switchTab(tabs[next].dataset.tab);});
+for (const button of document.querySelectorAll("[data-tab]")) {
+  button.addEventListener("click", () => switchTab(button.dataset.tab));
+  button.addEventListener("keydown", (e) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+    e.preventDefault();
+    const tabs = [...document.querySelectorAll("[data-tab]")],
+      index = tabs.indexOf(button),
+      next =
+        e.key === "Home"
+          ? 0
+          : e.key === "End"
+            ? tabs.length - 1
+            : (index + (e.key === "ArrowRight" ? 1 : -1) + tabs.length) %
+              tabs.length;
+    tabs[next].focus();
+    switchTab(tabs[next].dataset.tab);
+  });
 }
-$('#playerBack').addEventListener('click', () => {switchTab('files'); $('#filesNav').focus();});
-function renderFileStatistics() { const body = $('#fileStatistics'); body.replaceChildren(); for (const job of ui.jobs.filter(j => j.status === 'done')) {const row = node('tr'); for (const value of [job.filename, duration(job.duration_s), duration(job.wall_s), speed(job.rtfx), job.rtfx ? factor(1 / job.rtfx) : '—', duration(job.inference_s)]) row.append(node('td', '', value)); body.append(row);} if (!body.childNodes.length) {const cell = node('td', '', 'Statistics appear when a recording finishes.'); cell.colSpan = 6; const row = node('tr'); row.append(cell); body.append(row);} }
-const playback = {media: null, words: [], maxWordDuration: 0, highlighted: new Set(), frame: null, request: 0, manualScrollUntil: 0};
-const clock = seconds => {if (!Number.isFinite(seconds)) return '0:00'; const s = Math.max(0, Math.floor(seconds)), m = Math.floor(s / 60); return m >= 60 ? `${Math.floor(m / 60)}:${String(m % 60).padStart(2,'0')}:${String(s % 60).padStart(2,'0')}` : `${m}:${String(s % 60).padStart(2,'0')}`;};
-function canonical(text) {return text.normalize('NFC').toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');}
+$("#playerBack").addEventListener("click", () => {
+  switchTab("files");
+  $("#filesNav").focus();
+});
+function renderFileStatistics() {
+  const body = $("#fileStatistics");
+  body.replaceChildren();
+  for (const job of ui.jobs.filter((j) => j.status === "done")) {
+    const row = node("tr");
+    for (const value of [
+      job.filename,
+      duration(job.duration_s),
+      duration(job.wall_s),
+      speed(job.rtfx),
+      job.rtfx ? factor(1 / job.rtfx) : "—",
+      duration(job.inference_s),
+    ])
+      row.append(node("td", "", value));
+    body.append(row);
+  }
+  if (!body.childNodes.length) {
+    const cell = node("td", "", "Statistics appear when a recording finishes.");
+    cell.colSpan = 6;
+    const row = node("tr");
+    row.append(cell);
+    body.append(row);
+  }
+}
+const playback = {
+  media: null,
+  words: [],
+  maxWordDuration: 0,
+  highlighted: new Set(),
+  frame: null,
+  request: 0,
+  manualScrollUntil: 0,
+};
+const clock = (seconds) => {
+  if (!Number.isFinite(seconds)) return "0:00";
+  const s = Math.max(0, Math.floor(seconds)),
+    m = Math.floor(s / 60);
+  return m >= 60
+    ? `${Math.floor(m / 60)}:${String(m % 60).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`
+    : `${m}:${String(s % 60).padStart(2, "0")}`;
+};
+function canonical(text) {
+  return text
+    .normalize("NFC")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]/gu, "");
+}
 function alignedRanges(segment) {
- if (segment.alignment_valid !== true || !Array.isArray(segment.words) || !segment.words.length) return null;
- const text = segment.text.normalize('NFC'), indices = []; let normalized = '', utf16Index = 0;
- for (const char of text) {const value = canonical(char); for (const letter of value) {normalized += letter; indices.push({start: utf16Index, end: utf16Index + char.length});} utf16Index += char.length;}
- if (normalized !== segment.words.map(w => canonical(w.word)).join('')) return null;
- let cursor = 0; const ranges = [];
- for (const word of segment.words) {const length = canonical(word.word).length, start = word.start, end = word.end; if (!length || !Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start || (segment.duration_s && end > segment.duration_s + 0.1) || !Number.isFinite(segment.start_seconds)) return null; ranges.push({start: indices[cursor].start, end: indices[cursor + length - 1].end, from: segment.start_seconds + start, to: segment.start_seconds + end}); cursor += length;}
- return {text, ranges};
+  if (
+    segment.alignment_valid !== true ||
+    !Array.isArray(segment.words) ||
+    !segment.words.length
+  )
+    return null;
+  const text = segment.text.normalize("NFC"),
+    indices = [];
+  let normalized = "",
+    utf16Index = 0;
+  for (const char of text) {
+    const value = canonical(char);
+    for (const letter of value) {
+      normalized += letter;
+      indices.push({ start: utf16Index, end: utf16Index + char.length });
+    }
+    utf16Index += char.length;
+  }
+  if (normalized !== segment.words.map((w) => canonical(w.word)).join(""))
+    return null;
+  let cursor = 0;
+  const ranges = [];
+  for (const word of segment.words) {
+    const length = canonical(word.word).length,
+      start = word.start,
+      end = word.end;
+    if (
+      !length ||
+      !Number.isFinite(start) ||
+      !Number.isFinite(end) ||
+      start < 0 ||
+      end <= start ||
+      (segment.duration_s && end > segment.duration_s + 0.1) ||
+      !Number.isFinite(segment.start_seconds)
+    )
+      return null;
+    ranges.push({
+      start: indices[cursor].start,
+      end: indices[cursor + length - 1].end,
+      from: segment.start_seconds + start,
+      to: segment.start_seconds + end,
+    });
+    cursor += length;
+  }
+  return { text, ranges };
 }
 function renderSyncedTranscript(result) {
- const container = $('#syncedTranscript'); container.replaceChildren(); playback.words = []; playback.highlighted = new Set(); playback.maxWordDuration = 0; let aligned = 0, unaligned = 0;
- for (const segment of result.segments || []) {if (!segment.text?.trim()) continue; const paragraph = node('p', 'transcript-segment'), data = alignedRanges(segment); if (data) {let position = 0; for (const range of data.ranges) {paragraph.append(document.createTextNode(data.text.slice(position, range.start))); const button = node('button', 'timed-word', data.text.slice(range.start, range.end)); button.type = 'button'; button.title = `Play from ${clock(range.from)}`; button.dataset.start = range.from; button.dataset.end = range.to; button.addEventListener('click', () => {if (!playback.media) return; playback.media.currentTime = range.from; playback.manualScrollUntil = 0; updateWordHighlight(); playback.media.play().catch(() => {$('#mediaError').textContent = 'Press Play to begin playback.';});}); paragraph.append(button); playback.words.push({start:range.from, end:range.to, element:button}); playback.maxWordDuration = Math.max(playback.maxWordDuration, range.to - range.from); position = range.end;} paragraph.append(document.createTextNode(data.text.slice(position))); aligned++;} else {paragraph.append(document.createTextNode(segment.text)); paragraph.append(node('span', 'unaligned-label', 'Word timing unavailable for this segment.')); unaligned++;} container.append(paragraph);}
- if (!container.childNodes.length) container.append(node('p', '', result.text || 'No speech detected.'));
- playback.words.sort((a,b) => a.start - b.start);
- $('#alignmentNote').textContent = aligned && !unaligned ? 'Words follow playback. Click any word to seek.' : aligned ? 'Some segments have no word alignment; highlighting is available only where the model returned valid times.' : 'This recording has no valid word alignment. The full text is available without synchronized highlighting.';
- container.scrollTop = 0;
+  const container = $("#syncedTranscript");
+  container.replaceChildren();
+  playback.words = [];
+  playback.highlighted = new Set();
+  playback.maxWordDuration = 0;
+  let aligned = 0,
+    unaligned = 0;
+  for (const segment of result.segments || []) {
+    if (!segment.text?.trim()) continue;
+    const paragraph = node("p", "transcript-segment"),
+      data = alignedRanges(segment);
+    if (data) {
+      let position = 0;
+      for (const range of data.ranges) {
+        paragraph.append(
+          document.createTextNode(data.text.slice(position, range.start)),
+        );
+        const button = node(
+          "button",
+          "timed-word",
+          data.text.slice(range.start, range.end),
+        );
+        button.type = "button";
+        button.title = `Play from ${clock(range.from)}`;
+        button.dataset.start = range.from;
+        button.dataset.end = range.to;
+        button.addEventListener("click", () => {
+          if (!playback.media) return;
+          playback.media.currentTime = range.from;
+          playback.manualScrollUntil = 0;
+          updateWordHighlight();
+          playback.media.play().catch(() => {
+            $("#mediaError").textContent = "Press Play to begin playback.";
+          });
+        });
+        paragraph.append(button);
+        playback.words.push({
+          start: range.from,
+          end: range.to,
+          element: button,
+        });
+        playback.maxWordDuration = Math.max(
+          playback.maxWordDuration,
+          range.to - range.from,
+        );
+        position = range.end;
+      }
+      paragraph.append(document.createTextNode(data.text.slice(position)));
+      aligned++;
+    } else {
+      paragraph.append(document.createTextNode(segment.text));
+      paragraph.append(
+        node(
+          "span",
+          "unaligned-label",
+          "Word timing unavailable for this segment.",
+        ),
+      );
+      unaligned++;
+    }
+    container.append(paragraph);
+  }
+  if (!container.childNodes.length)
+    container.append(node("p", "", result.text || "No speech detected."));
+  playback.words.sort((a, b) => a.start - b.start);
+  $("#alignmentNote").textContent =
+    aligned && !unaligned
+      ? "Words follow playback. Click any word to seek."
+      : aligned
+        ? "Some segments have no word alignment; highlighting is available only where the model returned valid times."
+        : "This recording has no valid word alignment. The full text is available without synchronized highlighting.";
+  container.scrollTop = 0;
 }
 function updateWordHighlight() {
- const media = playback.media; if (!media) return; const time = media.currentTime; $('#playbackTime').textContent = `${clock(time)} / ${clock(media.duration)}`;
- const words = playback.words; let lo = 0, hi = words.length;
- while (lo < hi) {const mid = (lo + hi) >>> 1; if (words[mid].start <= time) lo = mid + 1; else hi = mid;}
- const current = new Set(); for (let i = lo - 1; i >= 0 && words[i].start >= time - playback.maxWordDuration; i--) if (words[i].end > time) current.add(words[i].element);
- for (const element of playback.highlighted) if (!current.has(element)) {element.classList.remove('speaking'); element.removeAttribute('aria-current');}
- let newest = null; for (const element of current) if (!playback.highlighted.has(element)) {element.classList.add('speaking'); element.setAttribute('aria-current','true'); newest = element;}
- playback.highlighted = current;
- if (newest && $('#followPlayback').checked && performance.now() >= playback.manualScrollUntil && !$('#playerTab').hidden) {const container = $('#syncedTranscript'), bounds = container.getBoundingClientRect(), word = newest.getBoundingClientRect(); if (word.top < bounds.top + 25 || word.bottom > bounds.bottom - 45) container.scrollBy({top:word.top - bounds.top - bounds.height * .4, behavior:window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth'});}
+  const media = playback.media;
+  if (!media) return;
+  const time = media.currentTime;
+  $("#playbackTime").textContent = `${clock(time)} / ${clock(media.duration)}`;
+  const words = playback.words;
+  let lo = 0,
+    hi = words.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (words[mid].start <= time) lo = mid + 1;
+    else hi = mid;
+  }
+  const current = new Set();
+  for (
+    let i = lo - 1;
+    i >= 0 && words[i].start >= time - playback.maxWordDuration;
+    i--
+  )
+    if (words[i].end > time) current.add(words[i].element);
+  for (const element of playback.highlighted)
+    if (!current.has(element)) {
+      element.classList.remove("speaking");
+      element.removeAttribute("aria-current");
+    }
+  let newest = null;
+  for (const element of current)
+    if (!playback.highlighted.has(element)) {
+      element.classList.add("speaking");
+      element.setAttribute("aria-current", "true");
+      newest = element;
+    }
+  playback.highlighted = current;
+  if (
+    newest &&
+    $("#followPlayback").checked &&
+    performance.now() >= playback.manualScrollUntil &&
+    !$("#playerTab").hidden
+  ) {
+    const container = $("#syncedTranscript"),
+      bounds = container.getBoundingClientRect(),
+      word = newest.getBoundingClientRect();
+    if (word.top < bounds.top + 25 || word.bottom > bounds.bottom - 45)
+      container.scrollBy({
+        top: word.top - bounds.top - bounds.height * 0.4,
+        behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+          ? "instant"
+          : "smooth",
+      });
+  }
 }
-function animatePlayback() {updateWordHighlight(); if (playback.media && !playback.media.paused && !playback.media.ended) playback.frame = requestAnimationFrame(animatePlayback);}
+function animatePlayback() {
+  updateWordHighlight();
+  if (playback.media && !playback.media.paused && !playback.media.ended)
+    playback.frame = requestAnimationFrame(animatePlayback);
+}
 async function showPlayer(job) {
- const request = ++playback.request; if (playback.media) playback.media.pause(); if (playback.frame) cancelAnimationFrame(playback.frame);
- switchTab('player'); $('#playerTitle').textContent = job.filename; $('#playerSubtitle').textContent = `${duration(job.duration_s)} · ${job.language.toUpperCase()} · ${speed(job.rtfx)} processing speed`; $('#playerEmpty').hidden = true; $('#playerWorkspace').hidden = false; $('#mediaError').textContent = ''; $('#alignmentNote').textContent = 'Loading transcript…'; $('#syncedTranscript').replaceChildren(node('p', '', 'Loading…'));
- $('#mediaMount').replaceChildren(); playback.words = []; playback.highlighted = new Set(); playback.media = null;
- $('#playerTxt').href = endpoint(job.id, 'txt'); $('#playerJson').href = endpoint(job.id, 'json');
- try {const result = await api(endpoint(job.id, 'json')); if (request !== playback.request) return; renderSyncedTranscript(result); const video = ['mp4','webm','mkv','mov','avi'].includes(job.filename.split('.').pop().toLowerCase()), media = node(video ? 'video' : 'audio'); media.controls = true; media.preload = 'metadata'; media.src = `/api/jobs/${encodeURIComponent(job.id)}/media`; media.setAttribute('aria-label', job.filename); media.playsInline = true; if (!video) {const cover = node('div','audio-cover'); cover.setAttribute('aria-hidden','true'); const svg = document.createElementNS('http://www.w3.org/2000/svg','svg'); svg.setAttribute('viewBox','0 0 64 64'); svg.setAttribute('fill','none'); svg.setAttribute('stroke','currentColor'); for (const [x,y] of [[10,25],[18,16],[26,8],[34,20],[42,12],[50,23]]) {const line = document.createElementNS('http://www.w3.org/2000/svg','path'); line.setAttribute('d',`M${x} ${y}V${64-y}`); line.setAttribute('stroke-linecap','round'); svg.append(line);} cover.append(svg); $('#mediaMount').append(cover);} $('#mediaMount').append(media); playback.media = media; media.playbackRate = Number($('#playbackSpeed').value);
- for (const event of ['timeupdate','seeked','loadedmetadata','durationchange']) media.addEventListener(event, updateWordHighlight);
- media.addEventListener('play', () => {if (playback.frame) cancelAnimationFrame(playback.frame); animatePlayback();});
- media.addEventListener('pause', () => {if (playback.frame) cancelAnimationFrame(playback.frame); updateWordHighlight();});
- media.addEventListener('ended', () => {if (playback.frame) cancelAnimationFrame(playback.frame); updateWordHighlight();});
- media.addEventListener('error', () => {$('#mediaError').textContent = 'This browser could not play the media format. Download the original recording and try a compatible player.';});
- } catch(e) {if (request === playback.request) $('#alignmentNote').textContent = `Could not load transcript: ${e.message}`;}
+  const request = ++playback.request;
+  if (playback.media) playback.media.pause();
+  if (playback.frame) cancelAnimationFrame(playback.frame);
+  switchTab("player");
+  $("#playerTitle").textContent = job.filename;
+  $("#playerSubtitle").textContent =
+    `${duration(job.duration_s)} · ${job.language.toUpperCase()} · ${speed(job.rtfx)} processing speed`;
+  $("#playerEmpty").hidden = true;
+  $("#playerWorkspace").hidden = false;
+  $("#mediaError").textContent = "";
+  $("#alignmentNote").textContent = "Loading transcript…";
+  $("#syncedTranscript").replaceChildren(node("p", "", "Loading…"));
+  $("#mediaMount").replaceChildren();
+  playback.words = [];
+  playback.highlighted = new Set();
+  playback.media = null;
+  $("#playerTxt").href = endpoint(job.id, "txt");
+  $("#playerJson").href = endpoint(job.id, "json");
+  try {
+    const result = await api(endpoint(job.id, "json"));
+    if (request !== playback.request) return;
+    renderSyncedTranscript(result);
+    const video = ["mp4", "webm", "mkv", "mov", "avi"].includes(
+        job.filename.split(".").pop().toLowerCase(),
+      ),
+      media = node(video ? "video" : "audio");
+    media.controls = true;
+    media.preload = "metadata";
+    media.src = `/api/jobs/${encodeURIComponent(job.id)}/media`;
+    media.setAttribute("aria-label", job.filename);
+    media.playsInline = true;
+    if (!video) {
+      const cover = node("div", "audio-cover");
+      cover.setAttribute("aria-hidden", "true");
+      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.setAttribute("viewBox", "0 0 64 64");
+      svg.setAttribute("fill", "none");
+      svg.setAttribute("stroke", "currentColor");
+      for (const [x, y] of [
+        [10, 25],
+        [18, 16],
+        [26, 8],
+        [34, 20],
+        [42, 12],
+        [50, 23],
+      ]) {
+        const line = document.createElementNS(
+          "http://www.w3.org/2000/svg",
+          "path",
+        );
+        line.setAttribute("d", `M${x} ${y}V${64 - y}`);
+        line.setAttribute("stroke-linecap", "round");
+        svg.append(line);
+      }
+      cover.append(svg);
+      $("#mediaMount").append(cover);
+    }
+    $("#mediaMount").append(media);
+    playback.media = media;
+    media.playbackRate = Number($("#playbackSpeed").value);
+    for (const event of [
+      "timeupdate",
+      "seeked",
+      "loadedmetadata",
+      "durationchange",
+    ])
+      media.addEventListener(event, updateWordHighlight);
+    media.addEventListener("play", () => {
+      if (playback.frame) cancelAnimationFrame(playback.frame);
+      animatePlayback();
+    });
+    media.addEventListener("pause", () => {
+      if (playback.frame) cancelAnimationFrame(playback.frame);
+      updateWordHighlight();
+    });
+    media.addEventListener("ended", () => {
+      if (playback.frame) cancelAnimationFrame(playback.frame);
+      updateWordHighlight();
+    });
+    media.addEventListener("error", () => {
+      $("#mediaError").textContent =
+        "This browser could not play the media format. Download the original recording and try a compatible player.";
+    });
+  } catch (e) {
+    if (request === playback.request)
+      $("#alignmentNote").textContent =
+        `Could not load transcript: ${e.message}`;
+  }
 }
-$('#playbackSpeed').addEventListener('change', () => {if (playback.media) playback.media.playbackRate = Number($('#playbackSpeed').value);});
-for (const event of ['wheel','touchstart']) $('#syncedTranscript').addEventListener(event, () => {playback.manualScrollUntil = performance.now() + 4000;}, {passive:true});
+$("#playbackSpeed").addEventListener("change", () => {
+  if (playback.media)
+    playback.media.playbackRate = Number($("#playbackSpeed").value);
+});
+for (const event of ["wheel", "touchstart"])
+  $("#syncedTranscript").addEventListener(
+    event,
+    () => {
+      playback.manualScrollUntil = performance.now() + 4000;
+    },
+    { passive: true },
+  );
 
-function infoRows(target, entries) {const list = $(target); list.replaceChildren(); for (const [label, value] of entries) {const pair = node('div','info-pair'); pair.append(node('dt','',label),node('dd','',value ?? 'Unavailable')); list.append(pair);} }
+function infoRows(target, entries) {
+  const list = $(target);
+  list.replaceChildren();
+  for (const [label, value] of entries) {
+    const pair = node("div", "info-pair");
+    pair.append(node("dt", "", label), node("dd", "", value ?? "Unavailable"));
+    list.append(pair);
+  }
+}
 function renderInfo(info) {
- const t = info.telemetry, lock = info.runtime, gpu = t?.gpu, ram = t?.ram;
- const number = (value, suffix, digits=1) => Number.isFinite(value) ? `${value.toFixed(digits)} ${suffix}` : 'Unavailable';
- $('#telemetryStatus').textContent = t ? `Updated ${new Date(t.sampled_at).toLocaleTimeString()} · live readings refresh automatically` : 'Live resource readings are unavailable. The monitor may be starting.';
- infoRows('#engineInfo', [['Model','Nemotron 3.5 Transcribe 30B-A4B'],['Quantization','IQ4_NL decoder + F16 speech encoder'],['Mode',info.backend === 'hybrid' ? 'CUDA + CPU expert offload' : 'CPU / RAM'],['Status',info.engine_ready ? 'Ready' : 'Loading / unavailable'],['CPU expert placement',t?.cpu_moe_blocks ? `Routed experts in the first ${t.cpu_moe_blocks} decoder blocks are in RAM` : info.backend === 'cpu' ? 'Entire model in system RAM' : 'Unavailable'],['Execution',info.backend === 'hybrid' ? 'Memory-mapped weights; one model, one worker' : 'One model, one worker'],['Subtitles','Only when model word alignment is valid']]);
- infoRows('#gpuInfo', [['Device',gpu?.name],['Total VRAM',number(gpu?.total_mib,'MiB',0)],['Used VRAM · all apps',number(gpu?.used_mib,'MiB',0)],['Model VRAM',gpu ? number(gpu.engine_used_mib,'MiB',0) : null],['GPU utilization',number(gpu?.utilization_percent,'%',0)],['Temperature',number(gpu?.temperature_c,'°C',0)],['Power',number(gpu?.power_w,'W')]]);
- infoRows('#hostInfo', [['Processor',t?.cpu?.name],['Logical cores',t?.cpu?.logical_cores],['Host CPU utilization',number(t?.cpu?.utilization_percent,'%',0)],['System RAM',number(ram?.total_gib,'GiB')],['Available RAM',number(ram?.available_gib,'GiB')],['Used RAM',number(ram?.used_gib,'GiB')],['Model process RSS',number(t?.engine_rss_mib,'MiB',0)],['Swap used',number(ram?.swap_used_gib,'GiB')]]);
- infoRows('#deploymentInfo', [['Access','Localhost · 127.0.0.1'],['Orchestration','Docker Compose'],['Storage free',number(info.disk_free_gib,'GiB')],['Upstream commit',lock?.upstream_commit],['Hybrid patch',t?.patch_commit ?? (info.backend === 'cpu' ? 'Not active' : null)],['Model snapshot',lock?.model_revision],['Upload limit',`${info.max_upload_mb} MB per file`],['Retention',info.retention_days ? `${info.retention_days} days for completed/failed jobs` : 'Until manually deleted']]);
+  const t = info.telemetry,
+    lock = info.runtime,
+    gpu = t?.gpu,
+    ram = t?.ram;
+  const number = (value, suffix, digits = 1) =>
+    Number.isFinite(value)
+      ? `${value.toFixed(digits)} ${suffix}`
+      : "Unavailable";
+  $("#telemetryStatus").textContent = t
+    ? `Updated ${new Date(t.sampled_at).toLocaleTimeString()} · live readings refresh automatically`
+    : "Live resource readings are unavailable. The monitor may be starting.";
+  infoRows("#engineInfo", [
+    ["Model", "Nemotron 3.5 Transcribe 30B-A4B"],
+    ["Quantization", "IQ4_NL decoder + F16 speech encoder"],
+    [
+      "Mode",
+      info.backend === "hybrid" ? "CUDA + CPU expert offload" : "CPU / RAM",
+    ],
+    ["Status", info.engine_ready ? "Ready" : "Loading / unavailable"],
+    [
+      "CPU expert placement",
+      t?.cpu_moe_blocks
+        ? `Routed experts in the first ${t.cpu_moe_blocks} decoder blocks are in RAM`
+        : info.backend === "cpu"
+          ? "Entire model in system RAM"
+          : "Unavailable",
+    ],
+    [
+      "Execution",
+      info.backend === "hybrid"
+        ? "Memory-mapped weights; one model, one worker"
+        : "One model, one worker",
+    ],
+    ["Subtitles", "Only when model word alignment is valid"],
+  ]);
+  infoRows("#gpuInfo", [
+    ["Device", gpu?.name],
+    ["Total VRAM", number(gpu?.total_mib, "MiB", 0)],
+    ["Used VRAM · all apps", number(gpu?.used_mib, "MiB", 0)],
+    ["Model VRAM", gpu ? number(gpu.engine_used_mib, "MiB", 0) : null],
+    ["GPU utilization", number(gpu?.utilization_percent, "%", 0)],
+    ["Temperature", number(gpu?.temperature_c, "°C", 0)],
+    ["Power", number(gpu?.power_w, "W")],
+  ]);
+  infoRows("#hostInfo", [
+    ["Processor", t?.cpu?.name],
+    ["Logical cores", t?.cpu?.logical_cores],
+    ["Host CPU utilization", number(t?.cpu?.utilization_percent, "%", 0)],
+    ["Model CPU consumption", number(t?.cpu?.engine_cpu_cores, "cores")],
+    ["System RAM", number(ram?.total_gib, "GiB")],
+    ["Available RAM", number(ram?.available_gib, "GiB")],
+    ["Used RAM", number(ram?.used_gib, "GiB")],
+    ["Model process RSS", number(t?.engine_rss_mib, "MiB", 0)],
+    ["Swap used", number(ram?.swap_used_gib, "GiB")],
+  ]);
+  infoRows("#deploymentInfo", [
+    ["Access", "Localhost · 127.0.0.1"],
+    ["Orchestration", "Docker Compose"],
+    ["Storage free", number(info.disk_free_gib, "GiB")],
+    ["Upstream commit", lock?.upstream_commit],
+    [
+      "Hybrid patch",
+      t?.patch_commit ?? (info.backend === "cpu" ? "Not active" : null),
+    ],
+    ["Model snapshot", lock?.model_revision],
+    ["Upload limit", `${info.max_upload_mb} MB per file`],
+    [
+      "Retention",
+      info.retention_days
+        ? `${info.retention_days} days for completed/failed jobs`
+        : "Until manually deleted",
+    ],
+  ]);
 }

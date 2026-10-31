@@ -179,3 +179,66 @@ def test_player_media_byte_ranges(isolated, wav_bytes):
         assert response.headers['content-range'] == f'bytes 0-43/{len(wav_bytes)}'
         assert 'inline' in response.headers['content-disposition']
         assert client.get('/api/jobs/missing/media').status_code == 404
+
+
+def test_retry_failed_and_done_keeps_upload_and_rejects_active(isolated, wav_bytes):
+    with TestClient(main.app) as client:
+        id = client.post('/api/jobs', files={'file':('recording.m4a',wav_bytes)}).json()['id']
+        assert client.post(f'/api/jobs/{id}/retry').status_code == 409
+        db.update_job(id,status='failed',error='Engine restarted')
+        assert client.post(f'/api/jobs/{id}/retry').status_code == 202
+        assert db.get_job(id)['error'] is None
+        assert len(list((isolated / 'uploads').iterdir())) == 1
+        db.update_job(id,status='done')
+        assert client.post(f'/api/jobs/{id}/retry').status_code == 202
+        assert client.post('/api/jobs/missing/retry').status_code == 404
+
+
+def test_resume_after_crash_skips_completed_chunks(isolated, wav_bytes, monkeypatch):
+    media=isolated / 'input.wav'
+    with wave.open(str(media),'wb') as file:
+        file.setnchannels(1);file.setsampwidth(2);file.setframerate(16000)
+        file.writeframes(b'\0\0' * 16000 * 3)
+    db.create_job('resume','input.wav',str(media),'ro',1,False)
+    calls=[]
+    def crash(path,*args):
+        calls.append(path.name)
+        if len(calls)==2:
+            raise RuntimeError('Simulated worker crash')
+        return {'text':'Bună','words':[{'word':'Bună','start':.1,'end':.4}]}
+    monkeypatch.setattr(worker,'transcribe_chunk',crash)
+    with pytest.raises(RuntimeError,match='Simulated'):
+        worker.do_job(db.claim_job())
+    assert (isolated/'results/resume/checkpoint.json').is_file()
+    db.recover_jobs()
+    resumed=[]
+    def success(path,*args):
+        resumed.append(path.name)
+        return {'text':'Bună','words':[{'word':'Bună','start':.1,'end':.4}]}
+    monkeypatch.setattr(worker,'transcribe_chunk',success)
+    worker.do_job(db.claim_job())
+    assert len(resumed)==2
+    assert resumed[0]=='chunk-00001.wav'
+    assert db.get_job('resume')['status']=='done'
+    result=json.loads((isolated/'results/resume/transcript.json').read_text())
+    assert len(result['segments'])==3
+    assert not (isolated/'results/resume/checkpoint.json').exists()
+
+
+def test_restart_outage_resumes_current_chunk_once(isolated,wav_bytes,monkeypatch):
+    media=isolated/'x.wav';media.write_bytes(wav_bytes)
+    db.create_job('outage','x.wav',str(media),'ro',60,False)
+    calls=[]
+    def respond(*args):
+        calls.append(1)
+        if len(calls)==1:
+            raise worker.BackendDisconnected('Engine restarted')
+        return {'text':'Salut','words':[{'word':'Salut','start':.1,'end':.8}]}
+    waited=[]
+    monkeypatch.setattr(worker,'transcribe_chunk',respond)
+    monkeypatch.setattr(worker,'model_ready',lambda:False)
+    monkeypatch.setattr(worker,'wait_for_model',lambda timeout=None:waited.append(timeout))
+    worker.do_job(db.claim_job())
+    assert len(calls)==2
+    assert waited==[900.0]
+    assert db.get_job('outage')['status']=='done'

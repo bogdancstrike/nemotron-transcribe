@@ -16,7 +16,7 @@ Built for **RTX 3080 10 GB + 64 GB RAM**, with a reproducible CPU baseline and e
 
 </div>
 
-![Nemotron transcription studio](docs/images/upload.png)
+![Nemotron transcription studio](assets/upload.png)
 
 ## The studio
 
@@ -48,7 +48,7 @@ Open **[localhost:7860](http://127.0.0.1:7860)**.
 
 The first explicit `docker compose up` builds the pinned runtime, downloads the exact decoder **and mandatory encoder**, verifies SHA-256 hashes, prepares writable data directories, and starts the web app, model server, worker and resource monitor. First provisioning takes time. Model weights and uploaded recordings are **never included in Git or Docker images**.
 
-The initial release defaults to the **verified CPU/RAM path**. The RTX 3080 hybrid patch is packaged separately and remains under hardware validation; see below. GPU availability alone does not imply expert offloading works.
+The default deployment uses the **tested RTX 3080 hybrid path**, with routed experts in system RAM. Install NVIDIA Container Toolkit and use a CUDA 13-compatible driver (tested: 580.178.04). For a GPU-independent CPU deployment, run `docker compose -f compose.yaml up --build -d`.
 
 ```bash
 # Watch provisioning and model startup
@@ -62,7 +62,7 @@ Existing complete model files are verified locally on subsequent starts, without
 
 ## Measured performance
 
-Measured on **Ryzen 9 9950X3D**, **64 GB RAM**, Ubuntu, using the exact IQ4_NL/F16 pair. These are warm **CPU** results from real Romanian recordings, not GPU estimates.
+Measured on **Ryzen 9 9950X3D**, **64 GB RAM**, Ubuntu, using the exact IQ4_NL/F16 pair. The CPU results below use real Romanian recordings. The hybrid comparison uses the identical 60-second WAV and the same pinned model pair.
 
 | CPU test | Result |
 | :--- | ---: |
@@ -82,7 +82,22 @@ Measured on **Ryzen 9 9950X3D**, **64 GB RAM**, Ubuntu, using the exact IQ4_NL/F
 
 **RTFx = audio duration ÷ processing time**; above 1× is faster than real time. **RTF = processing time ÷ audio duration**; below 1 is faster. Processing includes media preparation, model requests and export; upload, queue wait and model startup are excluded.
 
-These five results use excerpts starting 10 seconds into each recording. They **do not establish full-recording throughput**. Full-length tests and GPU measurements are still in progress. WER/CER are unreported because independent reference transcripts have not been supplied. A model transcript is not a reference transcript.
+These five results use excerpts starting 10 seconds into each recording. They **do not establish full-recording throughput**. Full-length tests are still in progress; measured GPU results are below. WER/CER are unreported because independent reference transcripts have not been supplied. A model transcript is not a reference transcript.
+
+### RTX 3080 hybrid proof
+
+Three sequential 60-second Romanian requests succeeded with the patched runtime:
+
+| Measurement | Result |
+| :--- | ---: |
+| Median warm model-request RTFx | **7.41×** |
+| Request time | **8.07–8.12 seconds** |
+| Peak model VRAM | **6,006 MiB** |
+| Peak total VRAM, including desktop | **6,941 MiB** |
+| Peak model process RSS | **17,034 MiB** |
+| Peak GPU utilization | **100%** |
+
+CPU inference on the same clip took about 21 seconds. The hybrid and CPU transcripts matched across all **179 normalized words**; punctuation differed. This is agreement between runtimes, **not ground-truth accuracy**. The hybrid figures exclude UI/queue/preparation time. Full-length tests are running separately.
 
 ## Hardware and offloading
 
@@ -100,13 +115,13 @@ The complete decoder and encoder do not fit in 10 GB VRAM. Stock NeMo-Speech.cpp
 
 `n_cpu_moe: 48` means routed-expert weights in the **first 48 decoder block indices**, not “48 MoE layers.” Attention, Mamba, router, shared-expert and encoder tensors retain their default GPU placement. Speculative decoding is disabled.
 
-**Experimental GPU launch** — requires NVIDIA Container Toolkit and a compatible driver. This is intentionally separate while the patched runtime is being validated:
+**Default GPU launch** — requires NVIDIA Container Toolkit and a compatible driver:
 
 ```bash
-docker compose -f compose.yaml -f compose.hybrid.yaml up --build -d
+docker compose up --build -d
 ```
 
-The first hybrid attempt exposed a placement-branch bug and failed at model load. That failure was captured; the corrected patch is being rebuilt and tested. No GPU throughput or VRAM-fit claim is made yet. Inspect [runtime.lock.json](runtime.lock.json), [runtime attribution](runtime/NOTICE.md), and the [acceptance criteria](docs/04-acceptance-criteria.md).
+The corrected patch passed three successive real-model requests on the target GPU. Full-length soak tests and independent Romanian accuracy evaluation remain open. Inspect [runtime.lock.json](runtime.lock.json), the [patch](runtime/hybrid.patch), and [runtime attribution](runtime/NOTICE.md) for exact provenance.
 
 ## Operations
 
@@ -122,7 +137,7 @@ docker compose restart
 docker compose down
 ```
 
-Files live in `./data`; models live in `./models`. Neither directory is tracked. Keep the same data directory across restarts. A host lock prevents a second worker from recovering active jobs. The current worker restarts interrupted files from the beginning; chunk checkpoint recovery and failed-job retry controls are the next hardening step.
+Files live in `./data`; models live in `./models`. Neither directory is tracked. Keep the same data directory across restarts. A host lock prevents a second worker from recovering active jobs. Completed segments are checkpointed atomically. After a worker restart, compatible checkpoints resume at the first unfinished segment. A changed backend or transcription setting starts a fresh run. The Files tab offers **Retry** for failed or completed recordings. An engine disconnect waits for recovery before safely resuming; uncertain live-request timeouts fail clearly instead of submitting duplicates.
 
 The UI binds only to **127.0.0.1**. The inference service has **no published host port**. This is a single-user local tool; public access needs a real authentication/reverse-proxy design.
 
@@ -142,7 +157,7 @@ uv pip install --python .venv/bin/python -r app/requirements.txt pytest pyyaml p
 # Add --reference reference.txt to compute Romanian WER/CER.
 ```
 
-The application suite currently passes **35 tests**, including actual FFmpeg conversion of a synthetic 60-minute MP4, queue recovery and locking, Unicode exports, byte-range playback, invalid alignment, bounded retries and OOM handling. That long-file test uses mocked inference. Browser checks separately exercise the real aligned player, upload navigation and mobile layout. Raw local evidence is stored under `evidence/` and excluded from Git because it can contain recordings and transcripts.
+The application suite currently passes **38 tests**, including checkpoint recovery, failed/completed-file retries, model-disconnect recovery, actual FFmpeg conversion of a synthetic 60-minute MP4, queue recovery and locking, Unicode exports, byte-range playback, invalid alignment, bounded retries and OOM handling. That long-file test uses mocked inference. Browser checks separately exercise the real aligned player, upload navigation and mobile layout. Raw local evidence is stored under `evidence/` and excluded from Git because it can contain recordings and transcripts.
 
 ## Architecture
 
