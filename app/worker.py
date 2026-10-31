@@ -246,6 +246,7 @@ def do_job(job: dict):
         try:
             saved = json.loads(checkpoint.read_text())
             saved['signature'].setdefault('output_language', 'source')
+            saved['signature'].setdefault('number_style', 'natural')
             if saved['signature'] == signature and isinstance(saved['segments'], list) and len(saved['segments']) <= len(chunks):
                 candidate = saved['segments']
                 offset = 0.0
@@ -260,6 +261,8 @@ def do_job(job: dict):
                 LOG.info('Resuming %s after %d completed segments', id, len(segments))
         except (OSError, ValueError, KeyError, TypeError):
             LOG.info('No compatible checkpoint for %s; starting at the first segment', id)
+        if checkpoint.exists() and not segments:
+            checkpoint.replace(outdir / f'checkpoint-superseded-{time.time_ns()}.json')
         update_job(id, completed_segments=len(segments), progress=min(99, round(100*len(segments)/len(chunks))))
         for n, path in enumerate(chunks):
             if n < len(segments):

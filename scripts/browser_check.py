@@ -6,7 +6,7 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright,expect
 
-TABS=['Upload','Files','Player','Statistics','Info','Settings','Corrections']
+TABS=['Upload','Files','Player','Statistics','Corrections','Info','Settings']
 
 
 def main():
@@ -34,6 +34,9 @@ def main():
         page.get_by_role('button',name='All',exact=False).first.click()
         page.locator('#fileSort').select_option('name');page.locator('#fileSort').select_option('newest')
         page.screenshot(path=str(args.output/'files-live.png'),full_page=True)
+        assert page.locator('#search').count()==0
+        assert page.locator('.job').count()<=10
+        page.locator('#filePagination select').select_option('50')
         page.locator(f'[data-job-id="{aligned["id"]}"] .preview-button').click()
         page.wait_for_selector('.timed-word')
         page.wait_for_function('() => document.querySelector("#mediaMount audio, #mediaMount video")?.readyState >= 1')
@@ -65,6 +68,11 @@ def main():
         page.locator('#correctionText').fill(text);page.locator('#saveCorrection').click()
         expect(page.locator('#correctionStatus')).to_have_text('All changes saved')
         page.reload();expect(page.locator('#correctionText')).to_have_value(text)
+        assert page.locator('#correctionText').bounding_box()['height']<500
+        page.locator('#toggleReviewFind').click()
+        page.locator('#reviewFindText').fill('lei');page.locator('#reviewFindNext').click()
+        expect(page.locator('#reviewFindCount')).to_contain_text('of')
+        page.locator('#closeReviewFind').click()
         page.screenshot(path=str(args.output/'corrections-live.png'),full_page=True)
         with page.expect_download() as info:page.locator('#exportCorrection').click()
         download=info.value

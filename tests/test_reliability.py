@@ -376,3 +376,39 @@ def test_correction_conflict_is_atomic(isolated):
         results=list(pool.map(save,['First review','Second review']))
     assert results.count(1)==1
     assert results.count('conflict')==1
+
+
+def test_digits_and_readable_speakers_use_chat_instruction(isolated,wav_bytes,monkeypatch):
+    path=isolated/'x.wav';path.write_bytes(wav_bytes)
+    real_client=httpx.Client;payloads=[]
+    def reply(request):
+        assert request.url.path=='/v1/chat/completions'
+        payloads.append(json.loads(request.content))
+        return httpx.Response(200,json={'transcription':{'text':'10 000 lei','words':[],'language':'ro','duration':2},'choices':[{'message':{'content':'10 000 lei'}}]})
+    monkeypatch.setattr(worker.httpx,'Client',lambda **kwargs:real_client(transport=httpx.MockTransport(reply),**kwargs))
+    result=worker.transcribe_chunk(path,'ro',True,'source','digits')
+    assert result['text']=='10 000 lei'
+    instruction=payloads[0]['messages'][0]['content'][0]['text']
+    assert '10 000 lei' in instruction
+    assert '<spk:0>' in instruction
+    assert payloads[0]['timestamp_granularities']==['word']
+
+
+def test_legacy_checkpoint_defaults_do_not_discard_chunks(isolated,wav_bytes,monkeypatch):
+    media=isolated/'legacy.wav'
+    with wave.open(str(media),'wb') as file:
+        file.setnchannels(1);file.setsampwidth(2);file.setframerate(16000);file.writeframes(b'\0\0'*48000)
+    db.create_job('legacy','legacy.wav',str(media),'ro',1,False)
+    calls=[]
+    def crash(*args):
+        calls.append(1)
+        if len(calls)==2:raise RuntimeError('stop')
+        return {'text':'Salut','words':[]}
+    monkeypatch.setattr(worker,'transcribe_chunk',crash)
+    with pytest.raises(RuntimeError):worker.do_job(db.claim_job())
+    path=isolated/'results/legacy/checkpoint.json';checkpoint=json.loads(path.read_text())
+    checkpoint['signature'].pop('number_style',None);checkpoint['signature'].pop('output_language',None)
+    path.write_text(json.dumps(checkpoint))
+    db.recover_jobs();resumed=[]
+    monkeypatch.setattr(worker,'transcribe_chunk',lambda *args:(resumed.append(1) or {'text':'Salut','words':[]}))
+    worker.do_job(db.claim_job());assert len(resumed)==2

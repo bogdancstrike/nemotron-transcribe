@@ -159,6 +159,11 @@
                     <option value="ro">Romanian</option>
                     <option value="en">English</option>
                   </select></label
+                ><label for="numberStyle"
+                  >Numbers<select id="numberStyle">
+                    <option value="digits">As digits (10 000)</option>
+                    <option value="natural">Natural wording</option>
+                  </select></label
                 ><label for="duration"
                   >Segment length<select id="duration">
                     <option value="60">60 seconds</option>
@@ -526,6 +531,17 @@
                 ></label
               ><select id="defaultOutputLanguage"></select>
             </div>
+            <div class="setting-row">
+              <label for="defaultNumberStyle"
+                >Number formatting<small
+                  >Ask the model for numeric values as digits. Verify important
+                  amounts against the recording.</small
+                ></label
+              ><select id="defaultNumberStyle">
+                <option value="digits">As digits</option>
+                <option value="natural">Natural wording</option>
+              </select>
+            </div>
             <label class="checkbox-row"
               ><input id="defaultDiarize" type="checkbox" /><span
                 >Identify speakers<small
@@ -593,8 +609,70 @@
           </div>
           <div class="correction-editor">
             <div class="correction-toolbar">
-              <label for="correctionText">Reviewed transcript</label
+              <label for="correctionText">Transcript</label
               ><span id="correctionStatus" role="status">Loading…</span>
+            </div>
+            <div class="editor-tools">
+              <button
+                id="reviewUndo"
+                aria-label="Undo edit"
+                title="Undo (Ctrl/⌘ Z)"
+              >
+                ↶</button
+              ><button
+                id="reviewRedo"
+                aria-label="Redo edit"
+                title="Redo (Ctrl/⌘ Shift Z)"
+              >
+                ↷</button
+              ><span class="tool-divider"></span
+              ><button id="toggleReviewFind">Find &amp; replace</button
+              ><button
+                id="insertReviewTime"
+                title="Insert the current recording time"
+              >
+                Insert time</button
+              ><button id="checkReviewNumbers">Check numbers</button>
+            </div>
+            <div id="reviewFindPanel" class="review-find" hidden>
+              <div>
+                <input
+                  id="reviewFindText"
+                  type="search"
+                  placeholder="Find in transcript"
+                  aria-label="Find in reviewed transcript"
+                /><input
+                  id="reviewReplaceText"
+                  type="text"
+                  placeholder="Replace with"
+                  aria-label="Replace with"
+                />
+              </div>
+              <div class="find-actions">
+                <span id="reviewFindCount" role="status"></span
+                ><button
+                  id="reviewFindPrev"
+                  class="secondary"
+                  aria-label="Previous match"
+                >
+                  ↑</button
+                ><button
+                  id="reviewFindNext"
+                  class="secondary"
+                  aria-label="Next match"
+                >
+                  ↓</button
+                ><button id="reviewReplaceOne" class="secondary">Replace</button
+                ><button id="reviewReplaceAll" class="secondary">
+                  Replace all</button
+                ><button
+                  id="closeReviewFind"
+                  class="secondary"
+                  aria-label="Close find"
+                >
+                  ×
+                </button>
+              </div>
             </div>
             <textarea
               id="correctionText"
@@ -614,6 +692,10 @@
             </div>
           </div>
         </div>
+        <details class="review-original">
+          <summary>View original model transcript</summary>
+          <pre id="reviewOriginalText"></pre>
+        </details>
       </section>
       <footer>
         <span id="backendLabel">CPU · RAM</span

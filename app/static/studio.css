@@ -2400,3 +2400,138 @@ footer {
     padding: 14px 12px;
   }
 }
+.editor-tools {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 14px;
+  border-bottom: 1px solid #f0f0f3;
+  flex-wrap: wrap;
+}
+.editor-tools button {
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  padding: 5px 8px;
+  font-size: 10px;
+  color: var(--muted);
+}
+.editor-tools button:hover {
+  color: var(--text);
+  background: #f0f0f3;
+}
+.editor-tools button:first-child,
+.editor-tools button:nth-child(2) {
+  font-size: 17px;
+  line-height: 1;
+  padding: 4px 7px;
+}
+.tool-divider {
+  width: 1px;
+  height: 14px;
+  background: var(--line);
+  margin: 0 5px;
+}
+.review-find {
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--line);
+  background: #fafafa;
+}
+.review-find > div:first-child {
+  display: flex;
+  gap: 10px;
+}
+.review-find input {
+  width: 50%;
+  border: 1px solid #dddde3;
+  border-radius: 6px;
+  padding: 7px 9px;
+  background: #fff;
+  font-size: 11px;
+}
+.find-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+.find-actions > span {
+  font-size: 10px;
+  color: var(--muted);
+  margin-right: auto;
+}
+.find-actions button {
+  font-size: 9px;
+  padding: 5px 8px;
+}
+.review-original {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 19px;
+}
+.review-original summary {
+  cursor: pointer;
+  list-style: none;
+}
+.review-original pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 20px;
+  font: 13px/1.8 var(--font);
+  max-height: 300px;
+  overflow: auto;
+}
+.correction-layout {
+  gap: 24px;
+}
+.correction-media .quiet {
+  font-size: 10px;
+}
+.correction-media .correction-note {
+  max-width: 360px;
+}
+.correction-editor {
+  box-shadow: 0 2px 10px #20202403;
+}
+#correctionText {
+  height: clamp(260px, 36dvh, 380px);
+}
+@media (max-width: 700px) {
+  .editor-tools {
+    padding: 7px 9px;
+    gap: 1px;
+  }
+  .editor-tools button {
+    font-size: 9px;
+    padding: 5px 6px;
+  }
+  .tool-divider {
+    margin: 0 3px;
+  }
+  .review-find {
+    padding: 10px 12px;
+  }
+  .review-find > div:first-child {
+    gap: 7px;
+  }
+  .review-find input {
+    font-size: 10px;
+    padding: 6px 8px;
+  }
+  .find-actions {
+    gap: 5px;
+  }
+  .find-actions button {
+    font-size: 8px;
+  }
+  .review-original {
+    font-size: 10px;
+  }
+  #correctionText {
+    height: 280px;
+  }
+}

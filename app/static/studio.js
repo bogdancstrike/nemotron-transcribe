@@ -157,6 +157,7 @@ $("#submit").addEventListener("click", async () => {
     settings = {
       language: $("#language").value,
       output_language: $("#outputLanguage").value,
+      number_style: $("#numberStyle").value,
       segment_seconds: $("#duration").value,
       diarize: String($("#diarize").checked),
     };
@@ -189,6 +190,7 @@ $("#submit").addEventListener("click", async () => {
   );
   await refresh();
   if (uploadedId) {
+    ui.fileStatus="all";ui.filePage=1;$("#fileSort").value="newest";renderJobs();
     switchTab("files");
     history.replaceState(
       {},
@@ -1306,6 +1308,8 @@ async function loadSettings() {
     ])
       languageOptions($(id), response.languages, special, value);
     $("#duration").value = s.segment_seconds;
+    $("#numberStyle").value = s.number_style || "digits";
+    $("#defaultNumberStyle").value = s.number_style || "digits";
     $("#diarize").checked = s.diarize;
     $("#defaultChunk").value = s.segment_seconds;
     $("#defaultDiarize").checked = s.diarize;
@@ -1344,6 +1348,7 @@ $("#settingsForm").addEventListener("submit", async (e) => {
     ),
     segment_seconds: Number($("#defaultChunk").value),
     input_language: $("#defaultInputLanguage").value,
+    number_style: $("#defaultNumberStyle").value,
     output_language: $("#defaultOutputLanguage").value,
     diarize: $("#defaultDiarize").checked,
   };
@@ -1482,7 +1487,11 @@ async function saveReview() {
         : saveReview();
   }
   const text = $("#correctionText").value;
-  if (text === corrections.savedText) return true;
+  if (text === corrections.savedText) {
+    sessionStorage.removeItem(correctionDraftKey());
+    $("#correctionStatus").textContent = "All changes saved";
+    return true;
+  }
   if (corrections.conflict) return false;
   const id = corrections.jobId,
     revision = corrections.revision;
@@ -1574,6 +1583,8 @@ async function showCorrections(id, navigate = true) {
       }
     } catch {}
     $("#correctionText").disabled = false;
+    $("#reviewOriginalText").textContent = review.original_text || review.text;
+    resetReviewHistory();
     countCorrection();
     renderCorrectionPicker();
     $("#correctionFile").value = id;
@@ -1600,6 +1611,7 @@ $("#correctionFile").addEventListener("change", (e) => {
   if (e.target.value) showCorrections(e.target.value);
 });
 $("#correctionText").addEventListener("input", () => {
+  if (!corrections.applyingHistory) rememberReview();
   countCorrection();
   keepCorrectionDraft();
   $("#correctionStatus").textContent = corrections.conflict
@@ -1764,3 +1776,221 @@ function paginateControl(target, total, page, size, change) {
   controls.append(info, prev, next);
   holder.append(label, controls);
 }
+
+function resetReviewHistory() {
+  corrections.history = [
+    { text: $("#correctionText").value, start: 0, end: 0 },
+  ];
+  corrections.historyIndex = 0;
+  corrections.lastHistoryTime = 0;
+  updateReviewHistoryButtons();
+}
+function updateReviewHistoryButtons() {
+  $("#reviewUndo").disabled = !(corrections.historyIndex > 0);
+  $("#reviewRedo").disabled = !(
+    corrections.history &&
+    corrections.historyIndex < corrections.history.length - 1
+  );
+}
+function rememberReview(force = false) {
+  const editor = $("#correctionText"),
+    entry = {
+      text: editor.value,
+      start: editor.selectionStart,
+      end: editor.selectionEnd,
+    };
+  corrections.history ??= [entry];
+  corrections.historyIndex ??= 0;
+  if (corrections.history[corrections.historyIndex]?.text === entry.text)
+    return;
+  const now = performance.now();
+  if (
+    !force &&
+    corrections.historyIndex > 0 &&
+    now - (corrections.lastHistoryTime || 0) < 500
+  )
+    corrections.history[corrections.historyIndex] = entry;
+  else {
+    corrections.history = corrections.history.slice(
+      0,
+      corrections.historyIndex + 1,
+    );
+    corrections.history.push(entry);
+    if (corrections.history.length > 30) corrections.history.shift();
+    corrections.historyIndex = corrections.history.length - 1;
+  }
+  corrections.lastHistoryTime = now;
+  updateReviewHistoryButtons();
+}
+function changeReviewHistory(delta) {
+  const index = corrections.historyIndex + delta;
+  if (!corrections.history || index < 0 || index >= corrections.history.length)
+    return;
+  corrections.historyIndex = index;
+  const entry = corrections.history[index],
+    editor = $("#correctionText");
+  corrections.applyingHistory = true;
+  editor.value = entry.text;
+  editor.setSelectionRange(entry.start, entry.end);
+  editor.dispatchEvent(new Event("input", { bubbles: true }));
+  corrections.applyingHistory = false;
+  editor.focus();
+  updateReviewHistoryButtons();
+}
+$("#reviewUndo").addEventListener("click", () => changeReviewHistory(-1));
+$("#reviewRedo").addEventListener("click", () => changeReviewHistory(1));
+function editedReview() {
+  corrections.lastHistoryTime = 0;
+  $("#correctionText").dispatchEvent(new Event("input", { bubbles: true }));
+}
+function findReview(direction = 1) {
+  const editor = $("#correctionText"),
+    query = $("#reviewFindText").value;
+  if (!query) {
+    $("#reviewFindCount").textContent = "";
+    return;
+  }
+  const text = editor.value.toLocaleLowerCase(),
+    needle = query.toLocaleLowerCase(),
+    matches = [];
+  for (
+    let from = 0;
+    (from = text.indexOf(needle, from)) >= 0;
+    from += Math.max(1, needle.length)
+  )
+    matches.push(from);
+  if (!matches.length) {
+    $("#reviewFindCount").textContent = "No matches";
+    return;
+  }
+  let position =
+    direction >= 0
+      ? matches.findIndex((i) => i >= editor.selectionEnd)
+      : matches.findLastIndex((i) => i < editor.selectionStart);
+  if (position < 0) position = direction >= 0 ? 0 : matches.length - 1;
+  editor.focus();
+  editor.setSelectionRange(matches[position], matches[position] + query.length);
+  $("#reviewFindCount").textContent = `${position + 1} of ${matches.length}`;
+}
+$("#toggleReviewFind").addEventListener("click", () => {
+  $("#reviewFindPanel").hidden = !$("#reviewFindPanel").hidden;
+  if (!$("#reviewFindPanel").hidden) $("#reviewFindText").focus();
+});
+$("#closeReviewFind").addEventListener("click", () => {
+  $("#reviewFindPanel").hidden = true;
+  $("#correctionText").focus();
+});
+$("#reviewFindNext").addEventListener("click", () => findReview(1));
+$("#reviewFindPrev").addEventListener("click", () => findReview(-1));
+$("#reviewFindText").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    findReview(e.shiftKey ? -1 : 1);
+  }
+});
+$("#reviewReplaceOne").addEventListener("click", () => {
+  const editor = $("#correctionText"),
+    query = $("#reviewFindText").value;
+  if (!query) return;
+  if (
+    editor.value
+      .slice(editor.selectionStart, editor.selectionEnd)
+      .toLocaleLowerCase() !== query.toLocaleLowerCase()
+  ) {
+    findReview();
+    return;
+  }
+  editor.setRangeText(
+    $("#reviewReplaceText").value,
+    editor.selectionStart,
+    editor.selectionEnd,
+    "end",
+  );
+  editedReview();
+  findReview();
+});
+$("#reviewReplaceAll").addEventListener("click", () => {
+  const editor = $("#correctionText"),
+    query = $("#reviewFindText").value;
+  if (!query) return;
+  const lower = editor.value.toLocaleLowerCase(),
+    needle = query.toLocaleLowerCase();
+  let result = "",
+    last = 0,
+    count = 0;
+  for (
+    let position = lower.indexOf(needle);
+    position >= 0;
+    position = lower.indexOf(needle, last)
+  ) {
+    result +=
+      editor.value.slice(last, position) + $("#reviewReplaceText").value;
+    last = position + query.length;
+    count++;
+  }
+  if (!count) {
+    $("#reviewFindCount").textContent = "No matches";
+    return;
+  }
+  editor.value = result + editor.value.slice(last);
+  editedReview();
+  $("#reviewFindCount").textContent = `Replaced ${count} matches`;
+});
+$("#insertReviewTime").addEventListener("click", () => {
+  if (!corrections.media) return;
+  const editor = $("#correctionText");
+  editor.setRangeText(
+    `[${clock(corrections.media.currentTime)}] `,
+    editor.selectionStart,
+    editor.selectionEnd,
+    "end",
+  );
+  editedReview();
+  editor.focus();
+});
+$("#checkReviewNumbers").addEventListener("click", () => {
+  const match =
+    /(?:punct(?:e)?|virgulă)\s+(?:zero\s*){2,}|(?:zero\s+){2,}zero/iu.exec(
+      $("#correctionText").value,
+    );
+  if (!match) {
+    $("#correctionStatus").textContent =
+      "No suspicious zero/separator phrases found. Verify important amounts by listening.";
+    return;
+  }
+  $("#reviewFindPanel").hidden = false;
+  $("#reviewFindText").value = match[0];
+  $("#correctionText").setSelectionRange(
+    match.index,
+    match.index + match[0].length,
+  );
+  $("#correctionText").focus();
+  $("#reviewFindCount").textContent = "Check this amount against the recording";
+});
+window.addEventListener("keydown", (e) => {
+  if ($("#correctionsTab").hidden) return;
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
+    e.preventDefault();
+    $("#reviewFindPanel").hidden = false;
+    $("#reviewFindText").focus();
+  }
+  if (
+    (e.ctrlKey || e.metaKey) &&
+    e.key.toLowerCase() === "z" &&
+    document.activeElement === $("#correctionText")
+  ) {
+    e.preventDefault();
+    changeReviewHistory(e.shiftKey ? 1 : -1);
+  }
+  if (
+    e.altKey &&
+    ["ArrowLeft", "ArrowRight"].includes(e.key) &&
+    corrections.media
+  ) {
+    e.preventDefault();
+    corrections.media.currentTime = Math.max(
+      0,
+      corrections.media.currentTime + (e.key === "ArrowLeft" ? -5 : 5),
+    );
+  }
+});

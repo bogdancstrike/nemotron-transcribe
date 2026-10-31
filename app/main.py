@@ -294,12 +294,13 @@ def completed_for_correction(id):
 def correction(id: str):
     job = completed_for_correction(id)
     saved = db.get_correction(id)
-    if saved:
-        return {**saved,'filename':job['filename']}
     path = OUTPUT / id / 'transcript.txt'
-    if not path.is_file():
+    original = path.read_text(encoding='utf-8') if path.is_file() else None
+    if saved:
+        return {**saved,'filename':job['filename'],'original_text':original}
+    if original is None:
         raise HTTPException(404, 'Transcript not available')
-    return {'job_id':id,'text':path.read_text(encoding='utf-8'),'revision':0,'updated_at':None,'filename':job['filename']}
+    return {'job_id':id,'text':original,'revision':0,'updated_at':None,'filename':job['filename'],'original_text':original}
 
 
 @app.put('/api/jobs/{id}/correction')

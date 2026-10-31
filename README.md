@@ -7,6 +7,7 @@
 A private transcription studio for **Nemotron 3.5 Transcribe 30B-A4B**.<br>
 Built for **RTX 3080 10 GB + 64 GB RAM**, with a reproducible CPU baseline and experimental expert offloading.
 
+[![Tests](https://github.com/bogdancstrike/nemotron-transcribe/actions/workflows/tests.yml/badge.svg)](https://github.com/bogdancstrike/nemotron-transcribe/actions/workflows/tests.yml)
 ![Local](https://img.shields.io/badge/inference-local-226b45?style=flat-square)
 ![Docker Compose](https://img.shields.io/badge/deployment-Docker_Compose-2496ed?style=flat-square)
 ![Romanian](https://img.shields.io/badge/Romanian-UTF--8-7656a8?style=flat-square)
@@ -20,56 +21,72 @@ Built for **RTX 3080 10 GB + 64 GB RAM**, with a reproducible CPU baseline and e
 
 ## The studio
 
-Five tabs. One local workspace.
+Seven focused pages. One local workspace.
 
 | Tab | What you get |
 | :--- | :--- |
 | **Upload** | A wide, centered file chooser. M4A first, plus MP4, WAV, MP3, FLAC and more. Multiple uploads, real upload progress, and automatic navigation to the new file. |
-| **Files** | A durable queue, per-file progress, elapsed time, throughput, TXT/JSON/SRT downloads and deletion controls. |
-| **Player** | Audio/video beside the full transcript. Word highlighting follows real model alignment; click a word to seek, change playback speed, or disable automatic scrolling. |
+| **Files** | A durable queue with status views, sorting, 10-row pagination, progress, per-file throughput, retry and compact export/correction controls. |
+| **Player** | Audio/video beside the full transcript. Matched words follow real model alignment. Click to seek, view/filter speakers, adjust playback-only sync offset, and change speed or automatic scrolling. |
 | **Statistics** | Per-file and aggregate processing time, RTF and RTFx. Totals use summed audio and processing times. |
-| **Info** | Deployment revisions and live host CPU/RAM, model RSS, storage and available GPU telemetry. |
+| **Corrections** | Listen while editing a separately saved transcript. Autosave, conflict protection, rewind controls, TXT/JSON export and browser draft recovery. |
+| **Info** | Deployment revisions, every accepted file type, host CPU/RAM, model RSS, storage and GPU memory, load, power and temperature. |
+| **Settings** | Parallel processing levels 1, 2, 4, 8, 16 or custom within capacity; chunk size, input/output languages, number formatting and speaker defaults. |
 
-**Romanian by default.** Diacritics remain intact throughout upload, transcription, playback and export. Language can also be English or automatic. Speaker labels are optional and local to each chunk.
+**Romanian by default.** Diacritics remain intact throughout upload, transcription, playback and export. Choose an input language or automatic detection, independently of the output language. Keep the spoken language or request a translation. Speaker labels are optional and local to each chunk. Important numeric values can be requested as digits; always verify critical amounts against the recording.
 
-**No invented timestamps.** If alignment is missing, invalid or partial, text remains available; synchronized highlighting and SRT are withheld for unaligned text.
+**No invented timestamps.** Matching words can follow genuine model timestamps even when other text is unaligned. Untimed text remains readable. Complete SRT is exported only when alignment covers the full transcript. Translations and analyst edits may have no word timing.
 
 ## Screenshots
 
-Captured from the running local application. Resource readings and job status reflect the moment each screenshot was taken.
+Fresh captures from the running Docker deployment. Job status and resource readings are real snapshots, not demo values.
 
 <details>
 <summary><strong>Upload — centered file chooser</strong></summary>
 
-![Upload page](assets/upload.png)
+![Upload — centered file chooser](assets/upload.png)
 
 </details>
 
 <details>
-<summary><strong>Files — queue, progress, retry and exports</strong></summary>
+<summary><strong>Files — status views, sorting, pagination and actions</strong></summary>
 
-![Files page](assets/files.png)
-
-</details>
-
-<details>
-<summary><strong>Player — recording and synchronized transcript</strong></summary>
-
-![Player page](assets/player.png)
+![Files — status views, sorting, pagination and actions](assets/files.png)
 
 </details>
 
 <details>
-<summary><strong>Statistics — per-file and aggregate performance</strong></summary>
+<summary><strong>Player — synchronized reading and playback</strong></summary>
 
-![Statistics page](assets/statistics.png)
+![Player — synchronized reading and playback](assets/player.png)
 
 </details>
 
 <details>
-<summary><strong>Info — live deployment and hardware consumption</strong></summary>
+<summary><strong>Statistics — measured per-file and combined throughput</strong></summary>
 
-![Info page](assets/info.png)
+![Statistics — measured per-file and combined throughput](assets/statistics.png)
+
+</details>
+
+<details>
+<summary><strong>Corrections — compact editor, autosave and export</strong></summary>
+
+![Corrections — compact editor, autosave and export](assets/corrections.png)
+
+</details>
+
+<details>
+<summary><strong>Info — hardware consumption, deployment and accepted formats</strong></summary>
+
+![Info — hardware consumption, deployment and accepted formats](assets/info.png)
+
+</details>
+
+<details>
+<summary><strong>Settings — concurrency, languages, numbers and speakers</strong></summary>
+
+![Settings — concurrency, languages, numbers and speakers](assets/settings.png)
 
 </details>
 
@@ -121,11 +138,11 @@ Measured on **Ryzen 9 9950X3D**, **64 GB RAM**, Ubuntu, using the exact IQ4_NL/F
 
 **RTFx = audio duration ÷ processing time**; above 1× is faster than real time. **RTF = processing time ÷ audio duration**; below 1 is faster. Processing includes media preparation, model requests and export; upload, queue wait and model startup are excluded.
 
-These five results use excerpts starting 10 seconds into each recording. They **do not establish full-recording throughput**. Full-length tests are still in progress; measured GPU results are below. WER/CER are unreported because independent reference transcripts have not been supplied. A model transcript is not a reference transcript.
+These five results use excerpts starting 10 seconds into each recording. They **do not establish full-recording throughput**. Full-length tests are still in progress; measured GPU results are below. WER/CER are unreported because independent reference transcripts have not been supplied. A model transcript is not a reference transcript. The supplied amount example is tracked as a targeted regression, separately from corpus-wide WER/CER.
 
 ### RTX 3080 hybrid proof
 
-Three sequential 60-second Romanian requests succeeded with the patched runtime:
+Three sequential 60-second Romanian requests succeeded with the patched runtime in the initial single-slot configuration:
 
 | Measurement | Result |
 | :--- | ---: |
@@ -138,6 +155,19 @@ Three sequential 60-second Romanian requests succeeded with the patched runtime:
 
 CPU inference on the same clip took about 21 seconds. The hybrid and CPU transcripts matched across all **179 normalized words**; punctuation differed. This is agreement between runtimes, **not ground-truth accuracy**. The hybrid figures exclude UI/queue/preparation time. Full-length tests are running separately.
 
+### Full-recording progress
+
+These two requested recordings have completed in full through the real hybrid model:
+
+| Recording | Audio duration | Processing time | Per-file RTFx |
+| :--- | ---: | ---: | ---: |
+| `fanN33YW3fc.m4a` | 53m 44s | 24m 22s | 2.20× |
+| `dyVQpIUe1zc.m4a` | 55m 28s | 25m 39s | 2.16× |
+
+These were processed with other recordings active. Per-file times include waiting for shared model work; they are **not** the system's combined throughput. The Statistics page separately measures overlapping request intervals once when calculating combined model throughput.
+
+The other three requested full recordings remain in the queue or in progress. Deployment and checkpoint-migration tests interrupted some runs, so this is an operational soak test rather than a controlled hardware comparison. No full-corpus accuracy figure is claimed.
+
 ## Hardware and offloading
 
 | Component | Configuration |
@@ -148,7 +178,7 @@ CPU inference on the same clip took about 21 seconds. The hybrid and CPU transcr
 | Runtime | NVIDIA/NeMo-Speech.cpp, pinned to `20999cc921d2b14aa58708f61756a8b2e787ba20` |
 | Model snapshot | `dbd06c5cad7a2f33c8e06be2fb3ef814dbd9aa59` |
 | Target GPU | RTX 3080 · 10 GB · compute capability 8.6 |
-| Concurrency | One model server, one host worker, one decode slot |
+| Concurrency | One model server, one host worker, 16 decode slots with a fixed 16,384-token shared pool; file concurrency defaults to 1 |
 
 The complete decoder and encoder do not fit in 10 GB VRAM. Stock NeMo-Speech.cpp does not expose the required CPU expert-placement setting. The local Apache-2.0 patch introduces `asr.salm.n_cpu_moe`, uses llama.cpp's existing CPU expert tensor helper, enables memory mapping, and selects the standard mixed-device scheduler for the Mamba/Transformer decoder.
 
@@ -160,7 +190,7 @@ The complete decoder and encoder do not fit in 10 GB VRAM. Stock NeMo-Speech.cpp
 docker compose up --build -d
 ```
 
-The corrected patch passed three successive real-model requests on the target GPU. Full-length soak tests and independent Romanian accuracy evaluation remain open. Inspect [runtime.lock.json](runtime.lock.json), the [patch](runtime/hybrid.patch), and [runtime attribution](runtime/NOTICE.md) for exact provenance.
+The corrected patch passed three successive real-model requests on the target GPU. Full-corpus soak tests and independent Romanian accuracy evaluation remain open; completed full recordings are listed above. Inspect [runtime.lock.json](runtime.lock.json), the [patch](runtime/hybrid.patch), and [runtime attribution](runtime/NOTICE.md) for exact provenance.
 
 ## Operations
 
@@ -196,7 +226,7 @@ uv pip install --python .venv/bin/python -r app/requirements.txt pytest pyyaml p
 # Add --reference reference.txt to compute Romanian WER/CER.
 ```
 
-The application suite currently passes **38 tests**, including checkpoint recovery, failed/completed-file retries, model-disconnect recovery, actual FFmpeg conversion of a synthetic 60-minute MP4, queue recovery and locking, Unicode exports, byte-range playback, invalid alignment, bounded retries and OOM handling. That long-file test uses mocked inference. Browser checks separately exercise the real aligned player, upload navigation and mobile layout. Raw local evidence is stored under `evidence/` and excluded from Git because it can contain recordings and transcripts.
+The application suite currently passes **54 tests**, including checkpoint recovery, failed/completed-file retries, model-disconnect recovery, actual FFmpeg conversion of a synthetic 60-minute MP4, queue recovery and locking, Unicode exports, byte-range playback, invalid alignment, bounded retries and OOM handling. That long-file test uses mocked inference. Browser checks separately exercise the real aligned player, upload navigation and mobile layout. Raw local evidence is stored under `evidence/` and excluded from Git because it can contain recordings and transcripts.
 
 ## Architecture
 
@@ -212,6 +242,26 @@ flowchart LR
     Worker --> Files
     Monitor[Read-only resource monitor] --> Web
 ```
+
+## A workflow that stays out of your way
+
+- Pages have real URLs: `/upload`, `/files`, `/player`, `/statistics`, `/corrections`, `/info`, `/settings`. Reload and browser Back/Forward keep your place. Player and Corrections URLs retain the selected recording.
+- Upload accepts **M4A, MP4, MP4A, WAV, MP3, FLAC, MKV, WEBM, MOV, AVI, OGG, OPUS and AAC**. FFprobe validates the actual audio stream; an extension alone is not enough.
+- Files and Statistics start at **10 rows per page**. Files can be filtered by queued, transcribing, completed or failed status, and sorted independently.
+- Corrections keep the original model transcript intact. Reviewed text has revision checks, autosave and per-tab draft recovery. A compact toolbar offers undo/redo, find-and-replace, playback-time insertion and number checks. It exports as TXT/JSON without attaching old word timing to changed words.
+- Higher concurrency shares the same model and memory pool. It can increase total throughput while reducing each file's speed. Settings never start a second model instance.
+
+### Number formatting and speaker output
+
+The model's stock speaker prompt can spell numeric punctuation incorrectly. The readable speaker path uses the documented SALM chat endpoint with a punctuation-preserving speaker instruction. The digits option asks the model to retain the numeric value in conventional notation, including Romanian amounts such as `10 000 lei`. This is an inference instruction, not a blind replacement of decimal/separator text. On the supplied Romanian news clip, the revised speaker instruction produced `10.000 de lei` in both places where the earlier speaker prompt produced “zece puncte zero zero zero.” This is a targeted regression check, not proof that every numeric expression is correct. Cases requiring verification remain reviewable in Corrections. The **Check numbers** tool flags suspicious zero/separator phrases for listening and manual review.
+
+## Current limits
+
+- Speaker labels are currently reliable only within their inference segment. File-wide speaker reconciliation is being developed; local slot numbers are not silently relabeled as stable identities.
+- Player highlighting uses actual model alignment and can be incomplete. Editable corrections export separately; changed words do not inherit timestamps from the original transcript.
+- Translated output may have no usable word alignment or speaker labels.
+- Concurrency above one is available, but more parallel work does not guarantee higher throughput. The default remains one file.
+- The three remaining full-file tests and independent-reference Romanian WER/CER validation are unfinished.
 
 ## Sources and licenses
 
