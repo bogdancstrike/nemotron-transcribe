@@ -7,6 +7,7 @@
     <title>Nemotron Transcribe</title>
     <link rel="stylesheet" href="/static/studio.css" />
     <script src="/static/studio.js" defer></script>
+    <script src="/static/review-sync.js" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -175,10 +176,19 @@
               <label class="checkbox-row"
                 ><input id="diarize" type="checkbox" /><span
                   >Identify speakers<small
-                    >Speaker labels may change between segments.</small
+                    >Identify speakers across this file (up to 60
+                    minutes).</small
                   ></span
                 ></label
               >
+              <label class="upload-guidance-label" for="uploadGuidance"
+                >Additional guidance<textarea
+                  id="uploadGuidance"
+                  maxlength="4000"
+                  rows="3"
+                  placeholder="Optional names, terms or transcription preferences"
+                ></textarea>
+              </label>
             </details>
             <button id="submit" class="primary" disabled>Transcribe</button>
           </div>
@@ -207,6 +217,7 @@
           <div class="section-cap">
             <h2>Files <span id="queueCount" class="count">0</span></h2>
           </div>
+          <div id="queueNotice" class="queue-notice" role="status" hidden></div>
           <div class="files-toolbar">
             <div class="status-views" aria-label="Filter file status">
               <button
@@ -225,7 +236,9 @@
                 Failed <span></span>
               </button>
             </div>
-            <label class="sort-label"
+            <button id="pauseQueue" class="secondary" type="button">
+              Pause queue</button
+            ><label class="sort-label"
               ><span class="visually-hidden">Sort files</span
               ><select id="fileSort">
                 <option value="newest">Newest first</option>
@@ -476,6 +489,15 @@
         <form id="settingsForm" class="settings-page">
           <section class="settings-card">
             <h2>Processing</h2>
+            <div class="settings-presets" aria-label="Processing presets">
+              <button type="button" data-preset="reliable" class="secondary">
+                Reliable</button
+              ><button type="button" data-preset="balanced" class="secondary">
+                Balanced</button
+              ><button type="button" data-preset="throughput" class="secondary">
+                Throughput
+              </button>
+            </div>
             <div class="setting-row">
               <label for="parallelLevel"
                 >Parallel files<small
@@ -545,11 +567,75 @@
             <label class="checkbox-row"
               ><input id="defaultDiarize" type="checkbox" /><span
                 >Identify speakers<small
-                  >Speaker IDs are local to each segment. Translations may not
-                  provide word timing or speaker labels.</small
+                  >One consistent set of speaker IDs per file (up to 60
+                  minutes). Translations may not provide word timing or speaker
+                  labels.</small
                 ></span
               ></label
             >
+          </section>
+          <section class="settings-card">
+            <h2>Decoding</h2>
+            <div class="setting-row">
+              <label for="modelTemperature"
+                >Temperature<small
+                  >0 uses greedy decoding. Higher values sample alternatives and
+                  can produce less consistent text.</small
+                ></label
+              ><input
+                id="modelTemperature"
+                type="number"
+                min="0"
+                max="1"
+                step="0.05"
+                value="0"
+              />
+            </div>
+            <div class="setting-row">
+              <label for="modelSeed"
+                >Sampling seed<small
+                  >Optional repeatable sampling seed. Has no effect on greedy
+                  decoding at temperature 0.</small
+                ></label
+              ><input
+                id="modelSeed"
+                type="number"
+                min="0"
+                max="2147483647"
+                step="1"
+                placeholder="Automatic"
+              />
+            </div>
+            <p class="quiet">
+              These controls are sent to the model for new uploads. They steer
+              decoding; they do not train model weights.
+            </p>
+          </section>
+          <section class="settings-card guidance-card">
+            <h2>Transcription guidance</h2>
+            <p class="quiet">
+              Tell the model how to write your transcript. Use an example as a
+              starting point, then adapt it to your recording.
+            </p>
+            <div id="guidanceExamples" class="guidance-examples"></div>
+            <label class="visually-hidden" for="defaultGuidance"
+              >Custom transcription guidance</label
+            ><textarea
+              id="defaultGuidance"
+              maxlength="4000"
+              rows="4"
+              placeholder="For example: Keep hesitations. Context names: Ștefan, București. Preserve technical abbreviations."
+            ></textarea>
+            <div class="guidance-caption">
+              <span id="guidanceCount">0 / 4000</span
+              ><button id="clearGuidance" class="secondary" type="button">
+                Clear
+              </button>
+            </div>
+            <p class="quiet">
+              Guidance applies to new uploads and can be overridden per file. It
+              steers the model; verify important names, quantities and facts.
+            </p>
           </section>
           <div class="settings-save">
             <span id="settingsMessage" role="status"></span
@@ -586,6 +672,10 @@
             <h2 id="correctionTitle"></h2>
             <div id="correctionMediaMount"></div>
             <div class="review-controls">
+              <label class="review-follow"
+                ><input id="reviewFollow" type="checkbox" checked />Follow
+                playback</label
+              >
               <button id="rewindCorrection" class="secondary">
                 ↶ 5 seconds</button
               ><button id="toggleCorrection" class="secondary">
@@ -674,13 +764,23 @@
                 </button>
               </div>
             </div>
-            <textarea
-              id="correctionText"
-              spellcheck="true"
-              placeholder="The transcript will appear here."
-            ></textarea>
+            <div class="review-text-surface">
+              <div
+                id="reviewHighlightLayer"
+                class="review-highlight-layer"
+                aria-hidden="true"
+              ></div>
+              <textarea
+                id="correctionText"
+                spellcheck="true"
+                placeholder="The transcript will appear here."
+              ></textarea>
+            </div>
             <div class="correction-bottom">
-              <span id="correctionCount"></span>
+              <div class="review-bottom-meta">
+                <span id="correctionCount"></span
+                ><span id="reviewSyncStatus" role="status"></span>
+              </div>
               <div>
                 <button id="saveCorrection" class="secondary">Save</button
                 ><button id="exportCorrection" class="primary compact">
@@ -748,5 +848,24 @@
         ><button id="confirmDelete" class="danger-button">Delete</button>
       </div>
     </dialog>
+    <div
+      id="reviewContextMenu"
+      class="review-context-menu"
+      role="menu"
+      aria-label="Transcript actions"
+      hidden
+    >
+      <button role="menuitem" id="reviewContextPlay">Play from this word</button
+      ><button role="menuitem" id="reviewContextReplay">
+        Replay around this word
+      </button>
+      <div class="context-separator"></div>
+      <button role="menuitem" id="reviewContextFind">Find selected text</button
+      ><button role="menuitem" id="reviewContextCopy">Copy selection</button
+      ><button role="menuitem" id="reviewContextTime">
+        Insert playback time
+      </button>
+      <p id="reviewContextNote"></p>
+    </div>
   </body>
 </html>

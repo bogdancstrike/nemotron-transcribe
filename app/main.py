@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 import db
 from db import DATA, create_job, get_job, init_db, list_jobs
 from media import probe_audio
-from settings import LANGUAGES, CAPACITY
+from settings import LANGUAGES, CAPACITY, GUIDANCE_EXAMPLES
 
 INPUT = DATA / 'uploads'
 OUTPUT = DATA / 'results'
@@ -126,12 +126,13 @@ async def system():
             'max_upload_mb': MAX_UPLOAD // (1024 * 1024),
             'disk_free_gib': round(usage.free / 1024**3, 2),
             'retention_days': int(os.getenv('RETENTION_DAYS', '0')),
-            'telemetry': telemetry, 'runtime': runtime, 'settings':db.get_settings(), 'engine_capacity':CAPACITY, 'accepted_filetypes':sorted(EXTS)}
+            'telemetry': telemetry, 'runtime': runtime, 'settings':db.get_settings(), 'worker':db.worker_state(), 'engine_capacity':CAPACITY, 'accepted_filetypes':sorted(EXTS)}
 
 
 @app.post('/api/jobs', status_code=201)
-async def upload(file: UploadFile = File(...), language: str | None = Form(None), segment_seconds: int | None = Form(None), diarize: bool | None = Form(None), output_language: str | None = Form(None), number_style: str | None = Form(None)):
+async def upload(file: UploadFile = File(...), language: str | None = Form(None), segment_seconds: int | None = Form(None), diarize: bool | None = Form(None), output_language: str | None = Form(None), number_style: str | None = Form(None), guidance: str | None = Form(None)):
     defaults = db.get_settings()
+    guidance = guidance.strip() if guidance is not None else defaults['guidance']
     number_style = number_style if number_style is not None else defaults['number_style']
     language = language if language is not None else defaults['input_language']
     output_language = output_language if output_language is not None else defaults['output_language']
@@ -140,6 +141,8 @@ async def upload(file: UploadFile = File(...), language: str | None = Form(None)
     original = Path((file.filename or '').replace('\\', '/')).name[:180]
     ext = Path(original).suffix.lower()
     try:
+        if len(guidance)>4000 or '<|' in guidance or '|>' in guidance:
+            raise HTTPException(400,'Guidance must contain at most 4000 characters and no model control tokens')
         if number_style not in {'natural','digits'}:
             raise HTTPException(400,'Number formatting must be natural or digits')
         if ext not in EXTS:
@@ -172,8 +175,10 @@ async def upload(file: UploadFile = File(...), language: str | None = Form(None)
                 duration = await asyncio.to_thread(probe_audio, dest)
             except ValueError as exc:
                 raise HTTPException(400, str(exc)) from exc
+            if diarize and duration>3600:
+                raise HTTPException(400,'File-wide speaker identification supports recordings up to 60 minutes. Turn off Identify speakers for longer recordings.')
             try:
-                await asyncio.to_thread(create_job, id, original, str(dest), language, segment_seconds, diarize, duration, output_language, number_style)
+                await asyncio.to_thread(create_job, id, original, str(dest), language, segment_seconds, diarize, duration, output_language, number_style, guidance, defaults['temperature'], defaults['seed'])
             except ValueError as exc:
                 raise HTTPException(429, str(exc)) from exc
             return {'id': id, 'status': 'queued'}
@@ -188,13 +193,16 @@ async def upload(file: UploadFile = File(...), language: str | None = Form(None)
 
 
 @app.get('/api/jobs')
-def jobs(all: bool = False):
+def jobs(all: bool = False, page: int | None = None, page_size: int = 10, status: str = 'all', sort: str = 'newest'):
+    if page is not None:
+        try:return db.list_jobs_page(page,page_size,status,sort)
+        except ValueError as exc:raise HTTPException(400,str(exc)) from exc
     return {'jobs': list_jobs(limit=None if all else 100)}
 
 
 @app.get('/api/stats')
 def stats():
-    return {**db.statistics(), **db.model_throughput()}
+    return {**db.statistics(), **db.model_throughput(), 'active': [j for j in db.list_jobs() if j['status'] in {'preparing','processing'}]}
 
 
 @app.get('/api/jobs/{id}')
@@ -230,13 +238,15 @@ def download(id: str, format: str):
     path = OUTPUT / item['id'] / f'transcript.{format}'
     if not path.is_file():
         raise HTTPException(404, 'Result not found')
+    if format == 'srt':
+        from worker import timing_suspect
+        metadata = OUTPUT / item['id'] / 'transcript.json'
+        if metadata.is_file() and any(timing_suspect(segment) for segment in json.loads(metadata.read_text()).get('segments',[])):
+            raise HTTPException(409,'Original word timing does not cover detected speech. Retry this recording to regenerate subtitles.')
     if format == 'json':
         # Backfill playback mappings for older exports without changing the stored model timings.
-        from worker import playback_words
-        data = json.loads(path.read_text())
-        for segment in data.get('segments', []):
-            if 'playback_words' not in segment:
-                segment['playback_words'] = playback_words(segment)
+        from transcript import present_result
+        data = present_result(json.loads(path.read_text()))
         return JSONResponse(data, headers={'Content-Disposition':FileResponse(path, filename=f'{Path(item["filename"]).stem[:90]}.json').headers['content-disposition']})
     return FileResponse(path, media_type='application/octet-stream', filename=f'{Path(item["filename"]).stem[:90]}.{format}')
 
@@ -259,9 +269,12 @@ def media(id: str):
 
 
 @app.post('/api/jobs/{id}/retry', status_code=202)
-def retry(id: str):
+def retry(id: str, values: dict | None = None):
+    values = values or {}
+    if not values.keys() <= {'use_current_settings'} or not isinstance(values.get('use_current_settings',False),bool):
+        raise HTTPException(400,'Use current settings must be a boolean')
     try:
-        row = db.retry_job(id)
+        row = db.retry_job(id,values.get('use_current_settings',False))
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     if row is None:
@@ -272,7 +285,7 @@ def retry(id: str):
 @app.get('/api/settings')
 def settings():
     return {'settings':db.get_settings(), 'languages':LANGUAGES, 'engine_capacity':CAPACITY,
-            'active_jobs':sum(j['status'] in {'preparing','processing'} for j in db.list_jobs())}
+            'guidance_examples':GUIDANCE_EXAMPLES, 'active_jobs':sum(j['status'] in {'preparing','processing'} for j in db.list_jobs())}
 
 
 @app.put('/api/settings')
@@ -295,7 +308,8 @@ def correction(id: str):
     job = completed_for_correction(id)
     saved = db.get_correction(id)
     path = OUTPUT / id / 'transcript.txt'
-    original = path.read_text(encoding='utf-8') if path.is_file() else None
+    from transcript import readable_text
+    original = readable_text(path.read_text(encoding='utf-8')) if path.is_file() else None
     if saved:
         return {**saved,'filename':job['filename'],'original_text':original}
     if original is None:
@@ -328,3 +342,22 @@ def export_correction(id: str, format: str):
     return JSONResponse({'job_id':id,'original_filename':job['filename'],'text':value['text'],
                          'revision':value['revision'],'updated_at':value['updated_at'],
                          'timing_source':None,'note':'Analyst-edited text; original alignment is not attached to changed words.'},headers=headers)
+
+
+@app.post('/api/jobs/{id}/correction/alignment')
+def review_alignment(id: str, values: dict):
+    completed_for_correction(id)
+    text = values.get('text')
+    if not isinstance(text,str) or len(text)>2_000_000:
+        raise HTTPException(400,'Text must contain at most 2 million characters')
+    path = OUTPUT / id / 'transcript.json'
+    if not path.is_file():
+        return {'words':[],'matched_words':0,'total_words':len(text.split()),'timestamp_source':None}
+    from review import align_review, source_words
+    stat = path.stat()
+    return align_review(text,source_words(str(path),stat.st_mtime_ns,stat.st_size))
+
+
+@app.exception_handler(db.sqlite3.DatabaseError)
+async def database_unavailable(request,exc):
+    return JSONResponse({'detail':'The local job database is unavailable. Uploaded media is preserved. Check the data directory or restore a database backup.'},status_code=503)

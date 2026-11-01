@@ -110,6 +110,7 @@ services:
     <<: *app
     user: '${HOST_UID:-1000}:${HOST_GID:-1000}'
     command: ['python', 'worker.py']
+    stop_grace_period: 2m
     environment:
       DATA_DIR: /data
       NEMO_URL: http://nemo:8080

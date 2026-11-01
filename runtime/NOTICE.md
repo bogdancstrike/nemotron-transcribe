@@ -12,7 +12,9 @@ third-party license installation steps remain intact.
 `hybrid.patch` contains changes to Apache-2.0 NVIDIA source. It adds a SALM
 configuration field and routes selected expert tensors through the existing
 llama.cpp CPU expert-placement helper. Mixed execution uses the standard ggml
-scheduler, not GPU-only fused serving. The source license headers are retained.
+scheduler, not GPU-only fused serving. The timestamp patch also aligns untagged
+transcripts across all audio frames instead of restricting them to one predicted
+speaker; explicitly tagged speaker streams retain their speaker priors. The source license headers are retained.
 The Apache-2.0 license and distribution conditions were inspected for this
 source-only patch; this is a technical license review, not legal certification.
 

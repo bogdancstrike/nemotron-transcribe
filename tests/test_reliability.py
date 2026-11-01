@@ -71,7 +71,8 @@ def test_single_claim_and_complete_recovery(isolated):
     db.update_job(id, status='processing', completed_segments=3, total_segments=5, progress=60)
     db.recover_jobs()
     recovered = db.get_job(id)
-    assert recovered['completed_segments'] == recovered['total_segments'] == recovered['progress'] == 0
+    assert (recovered['completed_segments'],recovered['total_segments'],recovered['progress']) == (3,5,60)
+    assert recovered['stage']=='recovering'
     assert recovered['status'] == 'queued'
 
 
@@ -139,7 +140,7 @@ def test_exact_offsets_and_hour_pipeline(isolated, monkeypatch):
     for segment in result['segments']:
         assert segment['start_seconds'] == pytest.approx(offset, abs=1/16000)
         offset += segment['duration_s']
-    assert result['speaker_scope'] == 'chunk'
+    assert result['speaker_scope'] is None
     assert result['srt_available']
     assert db.get_job('hour')['progress'] == 100
 
@@ -390,7 +391,8 @@ def test_digits_and_readable_speakers_use_chat_instruction(isolated,wav_bytes,mo
     assert result['text']=='10 000 lei'
     instruction=payloads[0]['messages'][0]['content'][0]['text']
     assert '10 000 lei' in instruction
-    assert '<spk:0>' in instruction
+    assert '<spk:0>' not in instruction
+    assert 'performed separately' in instruction
     assert payloads[0]['timestamp_granularities']==['word']
 
 

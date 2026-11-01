@@ -1,6 +1,7 @@
 """Durable FIFO. SQLite transactions coordinate API deletion and worker claims."""
 import os
 import json
+import time
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -47,6 +48,13 @@ def init_db():
         db.execute('INSERT OR IGNORE INTO settings(id,value) VALUES (1,?)', (json.dumps(DEFAULTS),))
         db.execute('CREATE TABLE IF NOT EXISTS corrections (job_id TEXT PRIMARY KEY,text TEXT NOT NULL,revision INTEGER NOT NULL,updated_at TEXT NOT NULL)')
         existing = {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}
+        db.execute('CREATE TABLE IF NOT EXISTS runtime_state (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL)')
+        for column,definition in {'temperature':'REAL NOT NULL DEFAULT 0','seed':'INTEGER','finished_at':'TEXT','stage':"TEXT NOT NULL DEFAULT 'queued'", 'heartbeat_at':'TEXT', 'segment_started_at':'TEXT', 'eta_updated_at':'TEXT', 'eta_seconds':'REAL', 'eta_low_s':'REAL', 'eta_high_s':'REAL', 'eta_samples':'INTEGER', 'attempts':'INTEGER NOT NULL DEFAULT 0', 'error_code':'TEXT'}.items():
+            if column not in existing:db.execute(f'ALTER TABLE jobs ADD COLUMN {column} {definition}')
+        db.execute("UPDATE jobs SET finished_at=updated_at WHERE status IN ('done','failed') AND finished_at IS NULL")
+        db.execute('CREATE INDEX IF NOT EXISTS jobs_status_created ON jobs(status,created_at)')
+        if 'guidance' not in existing:
+            db.execute("ALTER TABLE jobs ADD COLUMN guidance TEXT NOT NULL DEFAULT ''")
         if 'number_style' not in existing:
             db.execute("ALTER TABLE jobs ADD COLUMN number_style TEXT NOT NULL DEFAULT 'natural'")
         if 'output_language' not in existing:
@@ -59,23 +67,33 @@ def init_db():
                 db.execute(f'ALTER TABLE jobs ADD COLUMN {column} REAL')
 
 
-def create_job(id, filename, input_path, language, segment_seconds, diarize, duration_s=None, output_language="source", number_style="natural"):
+def create_job(id, filename, input_path, language, segment_seconds, diarize, duration_s=None, output_language="source", number_style="natural", guidance="", temperature=0.0, seed=None):
     with connection() as db:
         db.execute('BEGIN IMMEDIATE')
         count = db.execute("SELECT count(*) FROM jobs WHERE status IN ('queued','preparing','processing')").fetchone()[0]
         if count >= int(os.getenv('MAX_PENDING_JOBS', '100')):
             raise ValueError('Queue is full; wait for a job to finish')
         db.execute('''INSERT INTO jobs
-            (id,filename,input_path,status,language,segment_seconds,diarize,created_at,updated_at,duration_s,output_language,number_style)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
-            (id, filename, input_path, 'queued', language, segment_seconds, int(diarize), now(), now(), duration_s, output_language, number_style))
+            (id,filename,input_path,status,language,segment_seconds,diarize,created_at,updated_at,duration_s,output_language,number_style,guidance,temperature,seed)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (id, filename, input_path, 'queued', language, segment_seconds, int(diarize), now(), now(), duration_s, output_language, number_style, guidance, temperature, seed))
 
 
 def _public(row):
     if row is None:
         return None
     result = dict(row)
-    result.pop('input_path', None)
+    input_path=result.pop('input_path', None)
+    result['can_retry']=result['status'] in {'failed','done'} and bool(input_path and Path(input_path).is_file())
+    result['eta_remaining_s']=None
+    if result['status']=='processing' and result.get('eta_seconds') and result.get('eta_updated_at') and result.get('stage')!='waiting_for_engine':
+        elapsed=max(0,time.time()-datetime.fromisoformat(result['eta_updated_at']).timestamp())
+        if elapsed<result['eta_seconds']+max(30,result['eta_seconds']*.2):
+            result['eta_remaining_s']=max(1,result['eta_seconds']-elapsed)
+    result['worker_stale']=False
+    if result['status'] in {'processing','preparing'} and result.get('heartbeat_at'):
+        result['worker_stale']=time.time()-datetime.fromisoformat(result['heartbeat_at']).timestamp()>20
+        if result['worker_stale']:result['eta_remaining_s']=None
     result['srt_available'] = result['status'] == 'done' and (DATA / 'results' / result['id'] / 'transcript.srt').is_file()
     return result
 
@@ -91,10 +109,10 @@ def list_jobs(limit=100):
 
 
 def recover_jobs():
-    # Caller MUST hold the host worker lock. A crash restarts the whole job.
+    # Caller MUST hold the host worker lock. Completed chunks are restored from the checkpoint on restart.
     with connection() as db:
-        db.execute("""UPDATE jobs SET status='queued',error=NULL,progress=0,total_segments=0,
-            completed_segments=0,started_at=NULL,wall_s=NULL,inference_s=NULL,rtfx=NULL,updated_at=?
+        db.execute("""UPDATE jobs SET status='queued',error=NULL,stage='recovering',
+            segment_started_at=NULL,eta_seconds=NULL,eta_updated_at=NULL,updated_at=?
             WHERE status IN ('processing','preparing')""", (now(),))
 
 
@@ -106,15 +124,16 @@ def claim_job(max_active=1):
             return None
         row = db.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY created_at, rowid LIMIT 1").fetchone()
         if row:
-            db.execute("UPDATE jobs SET status='preparing',updated_at=?,started_at=? WHERE id=?", (now(), now(), row['id']))
+            db.execute("UPDATE jobs SET status='preparing',stage='preparing',attempts=attempts+1,error_code=NULL,updated_at=?,started_at=COALESCE(started_at,?) WHERE id=?", (now(), now(), row['id']))
             return dict(row)
         return None
 
 
 def update_job(id, **kwargs):
-    allowed = {'status','progress','total_segments','completed_segments','error','duration_s','wall_s','inference_s','rtfx'}
+    allowed = {'status','progress','total_segments','completed_segments','error','duration_s','wall_s','inference_s','rtfx','stage','heartbeat_at','segment_started_at','eta_updated_at','eta_seconds','eta_low_s','eta_high_s','eta_samples','error_code','finished_at'}
     if not kwargs or not kwargs.keys() <= allowed:
         raise ValueError('Invalid job fields')
+    if kwargs.get('status') in {'done','failed'}:kwargs.setdefault('finished_at',now())
     kwargs['updated_at'] = now()
     clause = ','.join(f'{key}=?' for key in kwargs)
     with connection() as db:
@@ -161,7 +180,7 @@ def statistics():
             'history': history, 'scope': 'completed_retained_jobs'}
 
 
-def retry_job(id):
+def retry_job(id, use_current_settings=False):
     with connection() as db:
         db.execute('BEGIN IMMEDIATE')
         row = db.execute('SELECT * FROM jobs WHERE id=?', (id,)).fetchone()
@@ -175,8 +194,12 @@ def retry_job(id):
         if count >= int(os.getenv('MAX_PENDING_JOBS', '100')):
             raise ValueError('Queue is full; wait for processing to finish')
         db.execute("""UPDATE jobs SET status='queued',error=NULL,progress=0,total_segments=0,
-            completed_segments=0,started_at=NULL,wall_s=NULL,inference_s=NULL,rtfx=NULL,updated_at=?
+            completed_segments=0,stage='queued',error_code=NULL,eta_seconds=NULL,started_at=NULL,finished_at=NULL,heartbeat_at=NULL,wall_s=NULL,inference_s=NULL,rtfx=NULL,updated_at=?
             WHERE id=?""", (now(), id))
+        if use_current_settings:
+            settings=get_settings()
+            db.execute('''UPDATE jobs SET language=?,output_language=?,number_style=?,guidance=?,temperature=?,seed=?,segment_seconds=?,diarize=? WHERE id=?''',
+                [settings['input_language'],settings['output_language'],settings['number_style'],settings['guidance'],settings['temperature'],settings['seed'],settings['segment_seconds'],int(settings['diarize']),id])
         return dict(row)
 
 
@@ -192,10 +215,18 @@ def save_settings(values):
     result = {**get_settings(), **values}
     if isinstance(result['parallel_jobs'], bool) or not isinstance(result['parallel_jobs'], int) or not 1 <= result['parallel_jobs'] <= CAPACITY:
         raise ValueError(f'Parallel jobs must be an integer from 1 to {CAPACITY}')
+    if isinstance(result['temperature'],bool) or not isinstance(result['temperature'],(int,float)) or not 0<=result['temperature']<=1:
+        raise ValueError('Temperature must be a number from 0 to 1')
+    if result['seed'] is not None and (isinstance(result['seed'],bool) or not isinstance(result['seed'],int) or not 0<=result['seed']<=2147483647):
+        raise ValueError('Seed must be empty or an integer from 0 to 2147483647')
     if result['segment_seconds'] not in (60, 120, 300):
         raise ValueError('Segment length must be 60, 120 or 300 seconds')
     if result['input_language'] not in {*LANGUAGES, 'auto'} or result['output_language'] not in {*LANGUAGES, 'source'}:
         raise ValueError('Unsupported input or output language')
+    if not isinstance(result['queue_paused'], bool):
+        raise ValueError('Queue pause must be a boolean')
+    if not isinstance(result['guidance'],str) or len(result['guidance'])>4000 or '<|' in result['guidance'] or '|>' in result['guidance']:
+        raise ValueError('Guidance must contain at most 4000 characters and no model control tokens')
     if result['number_style'] not in {'natural','digits'}:
         raise ValueError('Number formatting must be natural or digits')
     if not isinstance(result['diarize'], bool):
@@ -265,3 +296,51 @@ def save_correction(id, text, expected_revision):
             ON CONFLICT(job_id) DO UPDATE SET text=excluded.text,revision=excluded.revision,updated_at=excluded.updated_at''',
             (id,text,revision+1,now()))
         return dict(db.execute('SELECT * FROM corrections WHERE job_id=?',(id,)).fetchone())
+
+
+def worker_heartbeat(active_ids,engine_ready,stopping=False):
+    value={'heartbeat_at':now(),'active_jobs':len(active_ids),'engine_ready':engine_ready,'stopping':stopping}
+    with connection() as db:
+        db.execute('INSERT INTO runtime_state VALUES(1,?) ON CONFLICT(id) DO UPDATE SET value=excluded.value',(json.dumps(value),))
+        if active_ids:
+            placeholders=','.join('?' for _ in active_ids)
+            db.execute(f'UPDATE jobs SET heartbeat_at=? WHERE id IN ({placeholders})',[now(),*active_ids])
+
+
+def worker_state():
+    with connection() as db:
+        row=db.execute('SELECT value FROM runtime_state WHERE id=1').fetchone()
+    value=json.loads(row['value']) if row else {}
+    value['online']=bool(value.get('heartbeat_at') and time.time()-datetime.fromisoformat(value['heartbeat_at']).timestamp()<20 and not value.get('stopping'))
+    return value
+
+
+def backup_database():
+    if not DB.is_file():return
+    directory=DATA/'backups';directory.mkdir(parents=True,exist_ok=True)
+    name=datetime.now(timezone.utc).strftime('jobs-%Y-%m-%d.sqlite3')
+    target=directory/name
+    if target.exists():return
+    temporary=target.with_suffix('.tmp')
+    with sqlite3.connect(DB) as source, sqlite3.connect(temporary) as backup:
+        source.backup(backup)
+    temporary.replace(target)
+    for expired in sorted(directory.glob('jobs-*.sqlite3'))[:-3]:expired.unlink()
+
+
+def list_jobs_page(page=1,page_size=10,status='all',sort='newest'):
+    orders={'newest':'created_at DESC,rowid DESC','oldest':'created_at ASC,rowid ASC',
+            'name':'filename COLLATE NOCASE,created_at DESC',
+            'status':"CASE status WHEN 'queued' THEN 0 WHEN 'preparing' THEN 1 WHEN 'processing' THEN 1 WHEN 'failed' THEN 3 ELSE 2 END,created_at DESC"}
+    if sort not in orders or status not in {'all','queued','processing','preparing','done','failed'}:
+        raise ValueError('Unsupported status or sort order')
+    if not 1<=page_size<=100 or page<1:raise ValueError('Invalid pagination')
+    where,params='',[]
+    if status=='processing':where=" WHERE status IN ('preparing','processing')"
+    elif status!='all':where=' WHERE status=?';params=[status]
+    with connection() as db:
+        total=db.execute('SELECT count(*) FROM jobs'+where,params).fetchone()[0]
+        counts={row['status']:row['count'] for row in db.execute('SELECT status,count(*) AS count FROM jobs GROUP BY status')}
+        pages=max(1,(total+page_size-1)//page_size);page=min(page,pages)
+        rows=db.execute('SELECT * FROM jobs'+where+' ORDER BY '+orders[sort]+' LIMIT ? OFFSET ?', [*params,page_size,(page-1)*page_size]).fetchall()
+    return {'jobs':[_public(row) for row in rows],'total':total,'counts':counts,'page':page,'page_size':page_size,'pages':pages}

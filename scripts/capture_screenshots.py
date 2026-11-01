@@ -36,9 +36,26 @@ def main():
                 page.locator('#correctionText').fill(text);page.locator('#saveCorrection').click()
                 expect(page.locator('#correctionStatus')).to_have_text('All changes saved')
                 page.locator('#correctionTitle').click()
+                page.wait_for_selector('.review-timed-word')
+                page.wait_for_function('() => document.querySelector("#correctionMediaMount audio")?.readyState>=1')
+                word=page.locator('.review-timed-word').nth(8)
+                page.evaluate('(t)=>{document.querySelector("#correctionMediaMount audio").currentTime=t;}',float(word.get_attribute('data-start'))+.01)
+                expect(word).to_have_class('review-timed-word review-current-word')
             if tab=='info':page.wait_for_function('() => document.querySelector("#hostInfo").textContent.includes("Ryzen")')
             page.screenshot(path=str(args.output/(tab+'.png')),full_page=True)
             print('Captured '+tab,flush=True)
+            if tab=='corrections':
+                word=page.locator('.review-timed-word').nth(8);box=word.bounding_box()
+                page.mouse.click(box['x']+box['width']/2,box['y']+box['height']/2,button='right')
+                expect(page.locator('#reviewContextMenu')).to_be_visible()
+                page.screenshot(path=str(args.output/'corrections-menu.png'),full_page=True)
+                page.keyboard.press('Escape')
+        global_speakers=next((j for j in jobs if j['filename']=='romanian-news-file-speakers.wav' and j['status']=='done'),None)
+        if global_speakers:
+            page.goto(args.base_url+'/player?job='+global_speakers['id']);page.wait_for_selector('.timed-word')
+            page.locator('#transcriptView').select_option('speakers')
+            expect(page.locator('#speakerFilter')).to_be_visible()
+            page.screenshot(path=str(args.output/'player-speakers.png'),full_page=True)
         browser.close()
 
 

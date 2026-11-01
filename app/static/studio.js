@@ -158,6 +158,7 @@ $("#submit").addEventListener("click", async () => {
       language: $("#language").value,
       output_language: $("#outputLanguage").value,
       number_style: $("#numberStyle").value,
+      guidance: $("#uploadGuidance").value,
       segment_seconds: $("#duration").value,
       diarize: String($("#diarize").checked),
     };
@@ -190,7 +191,11 @@ $("#submit").addEventListener("click", async () => {
   );
   await refresh();
   if (uploadedId) {
-    ui.fileStatus="all";ui.filePage=1;$("#fileSort").value="newest";renderJobs();
+    ui.fileStatus = "all";
+    ui.filePage = 1;
+    $("#fileSort").value = "newest";
+    await refresh();
+    renderJobs();
     switchTab("files");
     history.replaceState(
       {},
@@ -217,9 +222,56 @@ function stat(label, value, cls = "") {
   return item;
 }
 function elapsed(job) {
+  if (job.worker_stale) return job.wall_s;
   if (["processing", "preparing"].includes(job.status) && job.started_at)
-    return Math.max(0, (Date.now() - Date.parse(job.started_at)) / 1000);
+    return (
+      (job.wall_s || 0) +
+      Math.max(
+        0,
+        (Date.now() -
+          Date.parse(
+            job.eta_updated_at || job.segment_started_at || job.started_at,
+          )) /
+          1000,
+      )
+    );
   return job.wall_s;
+}
+function fileDate(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isFinite(date.getTime())
+    ? date.toLocaleString(undefined, {
+        month: "short",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      })
+    : "—";
+}
+function fileMetrics(job) {
+  const row = node("div", "file-metrics");
+  const fields = [
+    ["Added at", fileDate(job.created_at), job.created_at],
+    ["Started", fileDate(job.started_at), job.started_at],
+    ["Ended", fileDate(job.finished_at), job.finished_at],
+    ["Process time", duration(active(job) ? elapsed(job) : job.wall_s)],
+    ["RTFx", speed(job.rtfx)],
+    ["RTF", job.rtfx ? factor(1 / job.rtfx) : "—"],
+  ];
+  for (const [label, value, timestamp] of fields) {
+    const cell = stat(label, value);
+    if (
+      label === "Process time" &&
+      ["processing", "preparing"].includes(job.status)
+    )
+      cell.querySelector("b").dataset.elapsedId = job.id;
+    if (timestamp) cell.title = new Date(timestamp).toLocaleString();
+    row.append(cell);
+  }
+  return row;
 }
 function renderJobs() {
   if (document.querySelector(".job-menu[open]")) return false;
@@ -236,17 +288,22 @@ function renderJobs() {
           : j.status === status)),
   );
   const ranks = { queued: 0, preparing: 1, processing: 1, done: 2, failed: 3 };
-  jobs.sort((a, b) =>
-    order === "oldest"
-      ? a.created_at.localeCompare(b.created_at)
-      : order === "name"
-        ? a.filename.localeCompare(b.filename)
-        : order === "status"
-          ? ranks[a.status] - ranks[b.status] ||
-            b.created_at.localeCompare(a.created_at)
-          : b.created_at.localeCompare(a.created_at),
-  );
-  $("#queueCount").textContent = ui.jobs.length;
+  if (!ui.fileResponse)
+    jobs.sort((a, b) =>
+      order === "oldest"
+        ? a.created_at.localeCompare(b.created_at)
+        : order === "name"
+          ? a.filename.localeCompare(b.filename)
+          : order === "status"
+            ? ranks[a.status] - ranks[b.status] ||
+              b.created_at.localeCompare(a.created_at)
+            : b.created_at.localeCompare(a.created_at),
+    );
+  $("#queueCount").textContent =
+    Object.values(ui.fileResponse?.counts || {}).reduce(
+      (sum, n) => sum + n,
+      0,
+    ) || ui.jobs.length;
   for (const button of document.querySelectorAll("[data-file-status]")) {
     const selected = button.dataset.fileStatus === status;
     button.classList.toggle("selected", selected);
@@ -258,9 +315,16 @@ function renderJobs() {
           ? ["preparing", "processing"].includes(j.status)
           : j.status === button.dataset.fileStatus),
     ).length;
-    button.querySelector("span").textContent = count;
+    const counts = ui.fileResponse?.counts;
+    button.querySelector("span").textContent = counts
+      ? button.dataset.fileStatus === "all"
+        ? Object.values(counts).reduce((sum, n) => sum + n, 0)
+        : button.dataset.fileStatus === "processing"
+          ? (counts.processing || 0) + (counts.preparing || 0)
+          : counts[button.dataset.fileStatus] || 0
+      : count;
   }
-  const allCount = jobs.length;
+  const allCount = ui.fileResponse?.total ?? jobs.length;
   const pageSize = ui.filePageSize || 10;
   ui.filePage = Math.max(
     1,
@@ -274,10 +338,11 @@ function renderJobs() {
     (page, size) => {
       ui.filePage = page;
       ui.filePageSize = size;
-      renderJobs();
+      refresh();
     },
   );
-  jobs = jobs.slice((ui.filePage - 1) * pageSize, ui.filePage * pageSize);
+  if (!ui.fileResponse)
+    jobs = jobs.slice((ui.filePage - 1) * pageSize, ui.filePage * pageSize);
   holder.replaceChildren();
   if (!jobs.length) {
     const empty = node("div", "empty-state");
@@ -287,7 +352,7 @@ function renderJobs() {
         "p",
         "",
         ui.jobs.length
-          ? "Try another status or search."
+          ? "Try another status."
           : "Add a recording in Upload to get started.",
       ),
     );
@@ -364,13 +429,27 @@ function renderJobs() {
         items.append(link);
       }
     }
-    if (["done", "failed"].includes(job.status))
+    if (["done", "failed"].includes(job.status) && job.can_retry !== false)
       action("Retry", async () => {
         try {
           await api(`/api/jobs/${encodeURIComponent(job.id)}/retry`, {
             method: "POST",
           });
           feedback("Recording queued for another run.");
+          await refresh();
+        } catch (error) {
+          feedback(error.message, true);
+        }
+      });
+    if (["done", "failed"].includes(job.status) && job.can_retry !== false)
+      action("Retry with current settings", async () => {
+        try {
+          await api(`/api/jobs/${encodeURIComponent(job.id)}/retry`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ use_current_settings: true }),
+          });
+          feedback("Queued with your current transcription settings.");
           await refresh();
         } catch (error) {
           feedback(error.message, true);
@@ -392,7 +471,7 @@ function renderJobs() {
       if (!menu.open && menu.isConnected) renderJobs();
     });
     head.append(menu);
-    card.append(head);
+    card.append(head, fileMetrics(job));
     if (active(job)) {
       const progress = node("div", "job-progress"),
         bar = node("progress");
@@ -408,12 +487,35 @@ function renderJobs() {
             ? "Waiting for an available slot"
             : job.status === "preparing"
               ? "Preparing the recording"
-              : `${job.completed_segments} of ${job.total_segments} segments`,
+              : job.stage === "waiting_for_engine"
+                ? "Waiting for model recovery"
+                : job.stage === "identifying_speakers"
+                  ? "Identifying speakers across this recording"
+                  : `${job.completed_segments} of ${job.total_segments} segments`,
         ),
         node("strong", "", `${job.progress}%`),
       );
       progress.append(bar, label);
       card.append(progress);
+    }
+    if (job.worker_stale)
+      card.append(
+        node(
+          "p",
+          "job-recovery-note",
+          "Worker disconnected. Your upload and saved progress are preserved; processing resumes when the worker restarts.",
+        ),
+      );
+    if (job.eta_remaining_s && !job.worker_stale) {
+      const eta = node(
+        "p",
+        "job-eta",
+        `About ${duration(job.eta_remaining_s)} remaining`,
+      );
+      eta.dataset.etaSeconds = job.eta_remaining_s;
+      eta.title =
+        "Estimate based on recent completed segments; shared model load can change it.";
+      card.append(eta);
     }
     if (job.error) card.append(node("p", "job-error", job.error));
     if (job.status !== "queued") {
@@ -512,10 +614,10 @@ function renderStats(stats) {
     ? `${(stats.rtfx * 60).toFixed(1)} audio min / processing hour`
     : "Measured after your first transcription";
   renderHistory(stats.history);
-  const running = ui.jobs.find((j) =>
+  const running = (stats.active || ui.jobs).find((j) =>
       ["preparing", "processing"].includes(j.status),
     ),
-    pending = ui.jobs.filter((j) => j.status === "queued").length;
+    pending = stats.counts.queued || 0;
   $("#queueSummary").hidden = !running && !pending;
   $("#activeSummary").textContent = running
     ? `Working on ${running.filename}`
@@ -581,17 +683,57 @@ for (const button of document.querySelectorAll(".filter"))
     renderJobs();
   });
 
-let refreshing = false;
+let refreshing = false,
+  refreshAgain = false;
 async function refresh() {
-  if (refreshing) return;
+  if (refreshing) {
+    refreshAgain = true;
+    return;
+  }
   refreshing = true;
+  const criteria = JSON.stringify([
+    ui.filePage || 1,
+    ui.filePageSize || 10,
+    ui.fileStatus || "all",
+    $("#fileSort").value,
+    ui.statsPage || 1,
+    ui.statsPageSize || 10,
+  ]);
   try {
-    const [jobs, stats] = await Promise.all([
-      api("/api/jobs?all=true"),
+    const [files, stats, statisticsPage] = await Promise.all([
+      api(
+        `/api/jobs?page=${ui.filePage || 1}&page_size=${ui.filePageSize || 10}&status=${ui.fileStatus || "all"}&sort=${$("#fileSort").value}`,
+      ),
       api("/api/stats"),
+      api(
+        `/api/jobs?page=${ui.statsPage || 1}&page_size=${ui.statsPageSize || 10}&status=done`,
+      ),
     ]);
-    ui.jobs = jobs.jobs;
-    const snapshot = JSON.stringify(ui.jobs);
+    if (
+      criteria !==
+      JSON.stringify([
+        ui.filePage || 1,
+        ui.filePageSize || 10,
+        ui.fileStatus || "all",
+        $("#fileSort").value,
+        ui.statsPage || 1,
+        ui.statsPageSize || 10,
+      ])
+    ) {
+      refreshAgain = true;
+      return;
+    }
+    ui.fileResponse = files;
+    ui.filePage = files.page;
+    ui.jobs = files.jobs;
+    ui.statsResponse = statisticsPage;
+    ui.statsPage = statisticsPage.page;
+    if (ui.reviewDoneCount !== stats.counts.done) {
+      const recent = await api("/api/jobs?page=1&page_size=100&status=done");
+      ui.reviewJobs = recent.jobs;
+      ui.reviewDoneCount = stats.counts.done;
+    }
+    const snapshot = JSON.stringify(ui.fileResponse);
     if (snapshot !== ui.lastJobs) {
       if (renderJobs() !== false) ui.lastJobs = snapshot;
     }
@@ -599,15 +741,23 @@ async function refresh() {
     renderFileStatistics();
     $("#refreshStatus").textContent = "● LIVE UPDATES";
   } catch {
+    $("#queueNotice").hidden = false;
+    $("#queueNotice").textContent =
+      "Could not refresh files. Your recordings are preserved; reconnecting automatically…";
     $("#refreshStatus").textContent = "RECONNECTING…";
   } finally {
     refreshing = false;
+    if (refreshAgain) {
+      refreshAgain = false;
+      queueMicrotask(refresh);
+    }
   }
 }
 async function refreshEngine() {
   try {
     const info = await api("/api/system");
     renderInfo(info);
+    renderQueueHealth(info);
     $("#engine").classList.toggle("ready", info.engine_ready);
     $("#engineLabel").textContent = info.engine_ready
       ? "Model ready"
@@ -686,27 +836,30 @@ function renderFileStatistics() {
   renderCorrectionPicker();
   const body = $("#fileStatistics");
   body.replaceChildren();
-  const completed = ui.jobs.filter((j) => j.status === "done"),
+  const completed =
+      ui.statsResponse?.jobs || ui.jobs.filter((j) => j.status === "done"),
     size = ui.statsPageSize || 10;
   ui.statsPage = Math.max(
     1,
-    Math.min(ui.statsPage || 1, Math.ceil(completed.length / size) || 1),
+    Math.min(
+      ui.statsPage || 1,
+      Math.ceil((ui.statsResponse?.total ?? completed.length) / size) || 1,
+    ),
   );
   paginateControl(
     "#statsPagination",
-    completed.length,
+    ui.statsResponse?.total ?? completed.length,
     ui.statsPage,
     size,
     (page, pageSize) => {
       ui.statsPage = page;
       ui.statsPageSize = pageSize;
-      renderFileStatistics();
+      refresh();
     },
   );
-  for (const job of completed.slice(
-    (ui.statsPage - 1) * size,
-    ui.statsPage * size,
-  )) {
+  for (const job of ui.statsResponse
+    ? completed
+    : completed.slice((ui.statsPage - 1) * size, ui.statsPage * size)) {
     const row = node("tr");
     for (const value of [
       job.filename,
@@ -839,7 +992,7 @@ function renderSyncedTranscript(result, preserveFilter = false) {
   playback.maxWordDuration = 0;
   const groups = new Map();
   for (const segment of result.segments || [])
-    for (const word of segment.words || []) {
+    for (const word of segment.alignment_warning ? [] : segment.words || []) {
       if (
         word.speaker === undefined ||
         word.speaker === null ||
@@ -849,7 +1002,10 @@ function renderSyncedTranscript(result, preserveFilter = false) {
         word.end <= word.start
       )
         continue;
-      const key = `${segment.index}|${word.speaker}`;
+      const key =
+        result.speaker_scope === "file"
+          ? String(word.speaker)
+          : `${segment.index}|${word.speaker}`;
       if (!groups.has(key))
         groups.set(key, {
           index: segment.index,
@@ -857,7 +1013,11 @@ function renderSyncedTranscript(result, preserveFilter = false) {
           offset: segment.start_seconds,
           words: [],
         });
-      groups.get(key).words.push(word);
+      groups.get(key).words.push({
+        ...word,
+        offset: segment.start_seconds,
+        segmentIndex: segment.index,
+      });
     }
   const selected = $("#speakerFilter").value;
   $("#speakerFilter").replaceChildren(node("option", "", "All speakers"));
@@ -866,7 +1026,9 @@ function renderSyncedTranscript(result, preserveFilter = false) {
     const option = node(
       "option",
       "",
-      `Segment ${group.index + 1} · Speaker ${group.speaker}`,
+      result.speaker_scope === "file"
+        ? `Speaker ${group.speaker}`
+        : `Segment ${group.index + 1} · Speaker ${group.speaker}`,
     );
     option.value = key;
     $("#speakerFilter").append(option);
@@ -896,17 +1058,19 @@ function renderSyncedTranscript(result, preserveFilter = false) {
         node(
           "span",
           "speaker-label",
-          `Segment ${group.index + 1} · Speaker ${group.speaker}`,
+          result.speaker_scope === "file"
+            ? `Speaker ${group.speaker}`
+            : `Segment ${group.index + 1} · Speaker ${group.speaker}`,
         ),
       );
       for (const word of group.words) {
         paragraph.append(
           wordButton(
             {
-              start: group.offset + word.start,
-              end: group.offset + word.end,
+              start: word.offset + word.start,
+              end: word.offset + word.end,
               speaker: word.speaker,
-              segmentIndex: group.index,
+              segmentIndex: word.segmentIndex,
             },
             word.word,
           ),
@@ -916,7 +1080,9 @@ function renderSyncedTranscript(result, preserveFilter = false) {
       container.append(paragraph);
     }
     $("#alignmentNote").textContent =
-      "Word-aligned text grouped by speaker. IDs are local to each segment; alignment wording may differ from the formatted transcript.";
+      result.speaker_scope === "file"
+        ? "Speakers identified across this recording. Only genuinely aligned words are timed."
+        : "Legacy segment speaker labels. Retry this file to identify speakers across the whole recording.";
   } else {
     for (const segment of result.segments || []) {
       if (!segment.text?.trim()) continue;
@@ -969,7 +1135,8 @@ function renderSyncedTranscript(result, preserveFilter = false) {
           node(
             "span",
             "unaligned-label",
-            "Word timing unavailable for this segment.",
+            segment.alignment_warning ||
+              "Word timing unavailable for this segment.",
           ),
         );
         unaligned++;
@@ -993,7 +1160,9 @@ function renderSyncedTranscript(result, preserveFilter = false) {
       node(
         "span",
         "speaker-key",
-        `${groups.size} segment/speaker groups · use By speaker to filter`,
+        result.speaker_scope === "file"
+          ? `${groups.size} speakers in this recording · use By speaker to filter`
+          : `${groups.size} segment/speaker groups · retry for file-wide identification`,
       ),
     );
   container.scrollTop = 0;
@@ -1310,6 +1479,12 @@ async function loadSettings() {
     $("#duration").value = s.segment_seconds;
     $("#numberStyle").value = s.number_style || "digits";
     $("#defaultNumberStyle").value = s.number_style || "digits";
+    $("#defaultGuidance").value = s.guidance || "";
+    $("#uploadGuidance").value = s.guidance || "";
+    renderGuidanceExamples(response.guidance_examples || []);
+    updateGuidanceCount();
+    $("#modelTemperature").value = s.temperature ?? 0;
+    $("#modelSeed").value = s.seed ?? "";
     $("#diarize").checked = s.diarize;
     $("#defaultChunk").value = s.segment_seconds;
     $("#defaultDiarize").checked = s.diarize;
@@ -1349,6 +1524,9 @@ $("#settingsForm").addEventListener("submit", async (e) => {
     segment_seconds: Number($("#defaultChunk").value),
     input_language: $("#defaultInputLanguage").value,
     number_style: $("#defaultNumberStyle").value,
+    guidance: $("#defaultGuidance").value,
+    temperature: Number($("#modelTemperature").value),
+    seed: $("#modelSeed").value === "" ? null : Number($("#modelSeed").value),
     output_language: $("#defaultOutputLanguage").value,
     diarize: $("#defaultDiarize").checked,
   };
@@ -1427,27 +1605,14 @@ function renderCorrectionPicker() {
   const old = corrections.jobId || select.value;
   select.replaceChildren(node("option", "", "Choose a recording"));
   select.firstChild.value = "";
-  const completed = ui.jobs.filter((j) => j.status === "done"),
-    size = ui.statsPageSize || 10;
-  ui.statsPage = Math.max(
-    1,
-    Math.min(ui.statsPage || 1, Math.ceil(completed.length / size) || 1),
-  );
-  paginateControl(
-    "#statsPagination",
-    completed.length,
-    ui.statsPage,
-    size,
-    (page, pageSize) => {
-      ui.statsPage = page;
-      ui.statsPageSize = pageSize;
-      renderFileStatistics();
-    },
-  );
-  for (const job of completed.slice(
-    (ui.statsPage - 1) * size,
-    ui.statsPage * size,
-  )) {
+  const completed = [
+    ...(ui.reviewJobs || ui.jobs.filter((j) => j.status === "done")),
+  ];
+  if (old && !completed.some((job) => job.id === old) && corrections.filename)
+    completed.unshift({ id: old, filename: corrections.filename });
+  select.title =
+    "Recent completed recordings. Open older recordings from Files.";
+  for (const job of completed) {
     const option = node("option", "", job.filename);
     option.value = job.id;
     select.append(option);
@@ -1599,6 +1764,7 @@ async function showCorrections(id, navigate = true) {
     media.setAttribute("aria-label", job.filename);
     $("#correctionMediaMount").replaceChildren(media);
     corrections.media = media;
+    if (window.ReviewSync) window.ReviewSync.load(id);
     media.addEventListener("error", () => {
       $("#correctionStatus").textContent =
         "The browser could not play this recording. Your text remains available.";
@@ -1611,6 +1777,7 @@ $("#correctionFile").addEventListener("change", (e) => {
   if (e.target.value) showCorrections(e.target.value);
 });
 $("#correctionText").addEventListener("input", () => {
+  if (window.ReviewSync) window.ReviewSync.changed();
   if (!corrections.applyingHistory) rememberReview();
   countCorrection();
   keepCorrectionDraft();
@@ -1711,7 +1878,7 @@ for (const button of document.querySelectorAll("[data-file-status]"))
   button.addEventListener("click", () => {
     ui.fileStatus = button.dataset.fileStatus;
     ui.filePage = 1;
-    renderJobs();
+    refresh();
     if (location.pathname === "/files") {
       const url = new URL(location.href);
       url.searchParams.set("status", ui.fileStatus);
@@ -1719,7 +1886,8 @@ for (const button of document.querySelectorAll("[data-file-status]"))
     }
   });
 $("#fileSort").addEventListener("change", () => {
-  renderJobs();
+  ui.filePage = 1;
+  refresh();
   if (location.pathname === "/files") {
     const url = new URL(location.href);
     url.searchParams.set("sort", $("#fileSort").value);
@@ -1994,3 +2162,84 @@ window.addEventListener("keydown", (e) => {
     );
   }
 });
+
+function renderGuidanceExamples(examples) {
+  const holder = $("#guidanceExamples");
+  holder.replaceChildren();
+  for (const example of examples) {
+    const button = node("button", "guidance-example", example.title);
+    button.type = "button";
+    button.title = example.text;
+    button.addEventListener("click", () => {
+      const field = $("#defaultGuidance");
+      field.value =
+        (field.value.trim() ? field.value.trim() + "\n" : "") + example.text;
+      field.value = field.value.slice(0, 4000);
+      updateGuidanceCount();
+      field.focus();
+    });
+    holder.append(button);
+  }
+}
+function updateGuidanceCount() {
+  $("#guidanceCount").textContent =
+    `${$("#defaultGuidance").value.length} / 4000`;
+}
+$("#defaultGuidance").addEventListener("input", updateGuidanceCount);
+$("#clearGuidance").addEventListener("click", () => {
+  $("#defaultGuidance").value = "";
+  updateGuidanceCount();
+});
+function renderQueueHealth(info) {
+  ui.queuePaused = !!info.settings?.queue_paused;
+  $("#pauseQueue").textContent = ui.queuePaused
+    ? "Resume queue"
+    : "Pause queue";
+  const notice = $("#queueNotice");
+  let text = "";
+  if (!info.worker?.online)
+    text = info.worker?.heartbeat_at
+      ? "The queue worker is offline. Files and completed chunks are preserved; processing resumes when it restarts."
+      : "The queue worker is starting. Uploads can wait safely in the queue.";
+  else if (!info.engine_ready)
+    text =
+      "The model is loading or unavailable. Your queued files are preserved.";
+  else if (ui.queuePaused)
+    text =
+      "Queue paused. Active files finish normally; waiting files stay queued.";
+  notice.hidden = !text;
+  notice.textContent = text;
+}
+$("#pauseQueue").addEventListener("click", async () => {
+  const button = $("#pauseQueue");
+  button.disabled = true;
+  try {
+    const result = await api("/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ queue_paused: !ui.queuePaused }),
+    });
+    ui.queuePaused = result.settings.queue_paused;
+    await refreshEngine();
+  } catch (error) {
+    feedback(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+for (const button of document.querySelectorAll("[data-preset]"))
+  button.addEventListener("click", () => {
+    const [parallel, chunk] = {
+      reliable: [1, 60],
+      balanced: [2, 120],
+      throughput: [4, 120],
+    }[button.dataset.preset];
+    $("#parallelLevel").value = String(parallel);
+    $("#customParallelRow").hidden = true;
+    $("#defaultChunk").value = String(chunk);
+    $("#modelTemperature").value = "0";
+    $("#modelSeed").value = "";
+    $("#settingsMessage").textContent =
+      "Preset selected. Save settings to apply it to new uploads.";
+  });

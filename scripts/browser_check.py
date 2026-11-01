@@ -30,7 +30,7 @@ def main():
         aligned=next(j for j in jobs if j['status']=='done' and j['srt_available'])
         page.get_by_role('tab',name='Files',exact=True).click();page.wait_for_selector('.job.done')
         page.get_by_role('button',name='Completed',exact=False).first.click()
-        assert page.locator('.job:not(.done)').count()==0
+        expect(page.locator('.job:not(.done)')).to_have_count(0)
         page.get_by_role('button',name='All',exact=False).first.click()
         page.locator('#fileSort').select_option('name');page.locator('#fileSort').select_option('newest')
         page.screenshot(path=str(args.output/'files-live.png'),full_page=True)

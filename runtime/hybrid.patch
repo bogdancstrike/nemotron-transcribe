@@ -31,6 +31,38 @@ index 12ce79a..6ba92aa 100644
          p.Register("max_sequences", &max_sequences, "SALM concurrent decode slots");
          p.Register(
              "n_ctx_per_sequence", &n_ctx_per_sequence,
+diff --git a/src/speechlm/pee/ctc_timestamp.cpp b/src/speechlm/pee/ctc_timestamp.cpp
+index 2e0cc80..0f5507f 100644
+--- a/src/speechlm/pee/ctc_timestamp.cpp
++++ b/src/speechlm/pee/ctc_timestamp.cpp
+@@ -806,6 +806,7 @@ CtcTimestampModel::word_timestamps(
+     // each alignment.
+     struct Prepared {
+         bool ok = false;
++        bool speaker_tagged = false;
+         ts::AlignmentTargets targets;
+         size_t head = 0;  // index in `heads` (requests with speaker streams)
+     };
+@@ -833,6 +834,7 @@ CtcTimestampModel::word_timestamps(
+             ev.head->wait();
+             if (!(ev.duration_seconds > 0.0) || !std::isfinite(ev.duration_seconds))
+                 throw std::runtime_error("invalid audio duration");
++            p.speaker_tagged = transcript.find("<spk:") != std::string::npos;
+             p.targets = ts::alignment_targets(impl_->tokenizer, transcript, blank, ev.ctc_frames());
+             if (!p.targets.streams.empty()) {
+                 p.head = heads.size();
+@@ -885,7 +887,10 @@ CtcTimestampModel::word_timestamps(
+             inputs.log_probs =
+                 p.targets.streams.empty() ? blank_only.data() : emissions[p.head].data();
+             inputs.frames = frames;
+-            inputs.speaker_probs = speaker.empty() ? nullptr : speaker.data();
++            // Untagged text is one transcript stream, not evidence of one speaker.
++            // Applying a single speaker prior collapses multi-speaker audio into that voice's
++            // activity windows. Align untagged text over all frames; retain diarization below.
++            inputs.speaker_probs = p.speaker_tagged && !speaker.empty() ? speaker.data() : nullptr;
+             inputs.speaker_frames = ev.encoder_frames;
+             inputs.speakers = ev.speakers;
+             inputs.activity10 = ev.activity10;
 diff --git a/src/speechlm/salm_engine.cpp b/src/speechlm/salm_engine.cpp
 index 70679df..62fd2e7 100644
 --- a/src/speechlm/salm_engine.cpp
