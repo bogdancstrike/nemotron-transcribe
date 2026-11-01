@@ -10,8 +10,74 @@ index ecdc3d1..a30daf8 100644
          "  --vad-model MODEL       Optional VAD model\n"
          "  --pnc-model MODEL       Optional punctuation model\n"
          "  --itn-model-dir MODEL   Optional ITN grammar directory\n"
+diff --git a/server/http/http_server.cpp b/server/http/http_server.cpp
+index 810dea2..d68c34f 100644
+--- a/server/http/http_server.cpp
++++ b/server/http/http_server.cpp
+@@ -1046,6 +1046,38 @@ struct Server::Impl {
+ #endif
+             });
+ 
++        server->Post("/v1/audio/alignments", [this](const httplib::Request& request, httplib::Response& response) {
++#if defined(NEMO_SPEECH_REGISTRY_ASR)
++            const auto upload = uploaded_file(request);
++            if (!request.form.has_field("text"))
++                throw std::invalid_argument("text is required for forced alignment");
++            const auto text = request.form.get_field("text");
++            const auto source = audio::load_wav_memory(
++                upload.content.data(), upload.content.size(), upload.filename);
++            const auto recognizer = this->models.asr();
++            const auto details = recognizer->force_align(
++                source.samples.data(), source.samples.size(), source.sample_rate, text);
++            Value root(Value::Object{});
++            root["text"] = text;
++            root["duration"] = details->duration_seconds;
++            root["timestamp_source"] = "forced_ctc_alignment";
++            root["alignment_status"] = details->alignment_status;
++            Value::Array words;
++            for (const auto& word : details->words) {
++                Value item(Value::Object{});
++                item["word"] = word.word;
++                item["start"] = word.start;
++                item["end"] = word.end;
++                words.emplace_back(std::move(item));
++            }
++            root["words"] = std::move(words);
++            response.set_content(root.dump(), "application/json");
++#else
++            (void)request;
++            fail(response, 501, "this build does not include forced alignment");
++#endif
++        });
++
+         auto diarize = [this](const httplib::Request& request, httplib::Response& response) {
+ #if defined(NEMO_SPEECH_REGISTRY_DIAR)
+             const auto upload = uploaded_file(request);
+diff --git a/src/asr/recognizer.cpp b/src/asr/recognizer.cpp
+index e5f7e43..845334c 100644
+--- a/src/asr/recognizer.cpp
++++ b/src/asr/recognizer.cpp
+@@ -852,6 +852,18 @@ Recognizer::diarize(const float* samples, size_t n, int sample_rate) const {
+     return offline_backend_->diarize(samples, n, sample_rate);
+ }
+ 
++bool
++Recognizer::supports_forced_alignment() const {
++    return offline_backend_ && offline_backend_->supports_forced_alignment();
++}
++
++std::shared_ptr<const SpeechLmDetails>
++Recognizer::force_align(const float* samples, size_t n, int sample_rate, const std::string& text) const {
++    if (!supports_forced_alignment())
++        throw std::runtime_error("forced alignment is not loaded");
++    return offline_backend_->force_align(samples, n, sample_rate, text);
++}
++
+ bool
+ Recognizer::supports_speaker_diarization() const {
+     return offline_backend_ ? offline_backend_->supports_speaker_diarization()
 diff --git a/src/asr/recognizer.h b/src/asr/recognizer.h
-index 12ce79a..6ba92aa 100644
+index 12ce79a..fdfe670 100644
 --- a/src/asr/recognizer.h
 +++ b/src/asr/recognizer.h
 @@ -45,6 +45,8 @@ struct SalmBackendConfig {
@@ -31,6 +97,26 @@ index 12ce79a..6ba92aa 100644
          p.Register("max_sequences", &max_sequences, "SALM concurrent decode slots");
          p.Register(
              "n_ctx_per_sequence", &n_ctx_per_sequence,
+@@ -93,6 +96,9 @@ class OfflineRecognitionBackend {
+     // seconds, speaker = the diarizer's column.
+     virtual bool supports_offline_diarization() const { return false; }
+     virtual std::vector<SpeechLmSegment> diarize(const float*, size_t, int) { return {}; }
++    virtual bool supports_forced_alignment() const { return false; }
++    virtual std::shared_ptr<const SpeechLmDetails> force_align(
++        const float*, size_t, int, const std::string&) { return {}; }
+     // Speech translation (AsrRequestOptions::speechlm.task = "translate") and its target languages.
+     virtual bool supports_translation() const { return false; }
+     virtual std::vector<std::string> translation_languages() const { return {}; }
+@@ -249,6 +255,9 @@ class Recognizer {
+     // diarize() throws without one.
+     bool supports_offline_diarization() const;
+     std::vector<SpeechLmSegment> diarize(const float* samples, size_t n, int sample_rate) const;
++    bool supports_forced_alignment() const;
++    std::shared_ptr<const SpeechLmDetails> force_align(
++        const float* samples, size_t n, int sample_rate, const std::string& text) const;
+     std::vector<std::string> translation_languages() const;
+     const std::string& model_name() const { return model_name_; }
+     std::vector<std::string> supported_languages() const;
 diff --git a/src/speechlm/pee/ctc_timestamp.cpp b/src/speechlm/pee/ctc_timestamp.cpp
 index 2e0cc80..0f5507f 100644
 --- a/src/speechlm/pee/ctc_timestamp.cpp
@@ -64,7 +150,7 @@ index 2e0cc80..0f5507f 100644
              inputs.speakers = ev.speakers;
              inputs.activity10 = ev.activity10;
 diff --git a/src/speechlm/salm_engine.cpp b/src/speechlm/salm_engine.cpp
-index 70679df..62fd2e7 100644
+index 70679df..711c41f 100644
 --- a/src/speechlm/salm_engine.cpp
 +++ b/src/speechlm/salm_engine.cpp
 @@ -180,7 +180,7 @@ constexpr size_t kEncoderAhead = 256;
@@ -125,8 +211,29 @@ index 70679df..62fd2e7 100644
          vocab = llama_model_get_vocab(model);
          if (const auto t = tokenize(vocab, kTurnEnd); t.size() == 1)
              im_end = t[0];
+@@ -2196,6 +2210,20 @@ struct SalmEngine::Impl {
+                 if (row_cancel[e.req]) {  // cancelled during the call: its output is discarded
+                     drop(e.req);
+                     ++dropped;
++                } else if (reqs[e.req].alignment_text) {
++                    SalmResult& r = results[e.req];
++                    r.text = *reqs[e.req].alignment_text;
++                    r.audio_tokens = e.frames;
++                    if (!e.error.empty()) {
++                        r.error = std::move(e.error);
++                        r.invalid_request = e.invalid_request;
++                        finished_reqs.push_back(e.req);
++                    } else if (!e.timestamps) {
++                        r.error = "forced alignment needs the CTC timestamp head";
++                        finished_reqs.push_back(e.req);
++                    } else {
++                        timestamp_ready.emplace_back(e.req, std::move(e.timestamps));
++                    }
+                 } else if (reqs[e.req].diarization_only) {
+                     finish_diarization(e);
+                 } else if (
 diff --git a/src/speechlm/salm_engine.h b/src/speechlm/salm_engine.h
-index f5053e9..ddaf74c 100644
+index f5053e9..0e24733 100644
 --- a/src/speechlm/salm_engine.h
 +++ b/src/speechlm/salm_engine.h
 @@ -34,6 +34,7 @@ struct SalmConfig {
@@ -137,8 +244,17 @@ index f5053e9..ddaf74c 100644
      int threads = 8;       // CPU threads for host-side decoder work
      // User turn; must contain exactly one audio locator.
      std::string prompt =
+@@ -88,6 +89,8 @@ struct SalmRequest {
+     // Speaker turns alone (with `timestamps`): the request ends at its encoder output, with the
+     // 10 ms diarization segments in SalmResult::details and no prefill, decode or transcript.
+     bool diarization_only = false;
++    // Client-supplied transcript: encoder + CTC only, without decoder generation.
++    std::optional<std::string> alignment_text;
+     // Decoded even when the speaker branch hears no voice (warmup, whose clips are noise).
+     bool decode_without_voice = false;
+     float temperature = 0;         // below 1e-5: greedy; else sampled at this temperature
 diff --git a/src/speechlm/salm_recognizer.cpp b/src/speechlm/salm_recognizer.cpp
-index 77bf828..89048e9 100644
+index 77bf828..be1a1b6 100644
 --- a/src/speechlm/salm_recognizer.cpp
 +++ b/src/speechlm/salm_recognizer.cpp
 @@ -53,6 +53,7 @@ engine_config(const asr::RecognizerConfig& c) {
@@ -157,3 +273,42 @@ index 77bf828..89048e9 100644
      // host-side decoder work: asr.backend.threads, as for the other models (0 = min(8, hardware
      // threads))
      const unsigned hw = std::thread::hardware_concurrency();
+@@ -322,6 +324,38 @@ class SalmRecognitionBackend final : public asr::OfflineRecognitionBackend {
+         }
+         return raw.details ? raw.details->diarization : std::vector<asr::SpeechLmSegment>{};
+     }
++    bool supports_forced_alignment() const override { return supports_word_timestamps(); }
++    std::shared_ptr<const asr::SpeechLmDetails> force_align(
++        const float* samples, size_t n, int rate, const std::string& text) override {
++        if (!supports_forced_alignment())
++            throw std::invalid_argument("forced alignment requires the encoder CTC head");
++        if (text.empty() || text.size() > 2000000)
++            throw std::invalid_argument("alignment text must contain 1..2000000 UTF-8 bytes");
++        if (rate == 0) rate = sample_rate();
++        if (rate < 8000 || rate > 96000 || !n || !samples)
++            throw std::invalid_argument("invalid forced-alignment audio");
++        const double seconds = static_cast<double>(n) / rate;
++        if (const auto error = policy::duration_limit_error(seconds))
++            throw std::invalid_argument(*error);
++        std::vector<float> resampled;
++        if (rate != sample_rate()) {
++            resampled = audio::resample_audio(samples, n, rate, sample_rate());
++            samples = resampled.data(); n = resampled.size(); rate = sample_rate();
++        }
++        SalmRequest request{"", samples, n, rate};
++        request.seconds = seconds;
++        request.timestamps = true;
++        request.alignment_text = text;
++        auto raw = submit(std::move(request));
++        if (!raw.error.empty()) throw std::runtime_error(raw.error);
++        if (!raw.details || raw.details->alignment_status != "aligned" ||
++            raw.details->words.empty() || raw.details->unaligned_words > 0)
++            throw std::runtime_error("CTC could not align the complete supplied transcript");
++        raw.details->text = text;
++        raw.details->duration_seconds = seconds;
++        raw.details->transcript_origin = "analyst";
++        return raw.details;
++    }
+     bool supports_translation() const override { return true; }
+     bool supports_instructions() const override { return true; }
+     std::vector<std::string> translation_languages() const override {

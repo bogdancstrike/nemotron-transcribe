@@ -6,8 +6,12 @@
     <meta name="theme-color" content="#f5f5f7" />
     <title>Nemotron Transcribe</title>
     <link rel="stylesheet" href="/static/studio.css" />
+    <link rel="stylesheet" href="/static/workspace.css" />
+    <link rel="stylesheet" href="/static/review-tools.css" />
     <script src="/static/studio.js" defer></script>
     <script src="/static/review-sync.js" defer></script>
+    <script src="/static/review-tools.js" defer></script>
+    <script src="/static/workspace-ui.js" defer></script>
   </head>
   <body>
     <header class="topbar">
@@ -233,7 +237,11 @@
               ><button data-file-status="done" aria-pressed="false">
                 Completed <span></span></button
               ><button data-file-status="failed" aria-pressed="false">
-                Failed <span></span>
+                Failed <span></span></button
+              ><button data-file-status="paused" aria-pressed="false">
+                Paused <span></span></button
+              ><button data-file-status="cancelled" aria-pressed="false">
+                Cancelled <span></span>
               </button>
             </div>
             <button id="pauseQueue" class="secondary" type="button">

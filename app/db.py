@@ -65,18 +65,24 @@ def init_db():
         for column in ('duration_s', 'wall_s', 'inference_s', 'rtfx'):
             if column not in existing:
                 db.execute(f'ALTER TABLE jobs ADD COLUMN {column} REAL')
+    from workspace_store import init_schema as workspace_schema
+    from review_tools import init_schema as review_schema
+    workspace_schema()
+    review_schema()
+    from alignment import init_schema as alignment_schema
+    alignment_schema()
 
 
-def create_job(id, filename, input_path, language, segment_seconds, diarize, duration_s=None, output_language="source", number_style="natural", guidance="", temperature=0.0, seed=None):
+def create_job(id, filename, input_path, language, segment_seconds, diarize, duration_s=None, output_language="source", number_style="natural", guidance="", temperature=0.0, seed=None, processing_options=None):
     with connection() as db:
         db.execute('BEGIN IMMEDIATE')
         count = db.execute("SELECT count(*) FROM jobs WHERE status IN ('queued','preparing','processing')").fetchone()[0]
         if count >= int(os.getenv('MAX_PENDING_JOBS', '100')):
             raise ValueError('Queue is full; wait for a job to finish')
         db.execute('''INSERT INTO jobs
-            (id,filename,input_path,status,language,segment_seconds,diarize,created_at,updated_at,duration_s,output_language,number_style,guidance,temperature,seed)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-            (id, filename, input_path, 'queued', language, segment_seconds, int(diarize), now(), now(), duration_s, output_language, number_style, guidance, temperature, seed))
+            (id,filename,input_path,status,language,segment_seconds,diarize,created_at,updated_at,duration_s,output_language,number_style,guidance,temperature,seed,processing_options)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (id, filename, input_path, 'queued', language, segment_seconds, int(diarize), now(), now(), duration_s, output_language, number_style, guidance, temperature, seed, json.dumps(processing_options or {},ensure_ascii=False)))
 
 
 def _public(row):
@@ -84,7 +90,12 @@ def _public(row):
         return None
     result = dict(row)
     input_path=result.pop('input_path', None)
-    result['can_retry']=result['status'] in {'failed','done'} and bool(input_path and Path(input_path).is_file())
+    for key,default in [('processing_options',{}),('tags',[])]:
+        if isinstance(result.get(key),str):
+            try:result[key]=json.loads(result[key])
+            except ValueError:result[key]=default
+    result['archived']=bool(result.get('archived'))
+    result['can_retry']=result['status'] in {'failed','done','cancelled'} and bool(input_path and Path(input_path).is_file())
     result['eta_remaining_s']=None
     if result['status']=='processing' and result.get('eta_seconds') and result.get('eta_updated_at') and result.get('stage')!='waiting_for_engine':
         elapsed=max(0,time.time()-datetime.fromisoformat(result['eta_updated_at']).timestamp())
@@ -148,6 +159,7 @@ def delete_job(id):
             return None
         if row['status'] in {'preparing', 'processing'}:
             raise ValueError('Active jobs cannot be deleted; wait for processing to finish')
+        db.execute('DELETE FROM review_annotations WHERE job_id=?',(id,))
         db.execute('DELETE FROM corrections WHERE job_id=?', (id,))
         db.execute('DELETE FROM processing_intervals WHERE job_id=?', (id,))
         db.execute('DELETE FROM jobs WHERE id=?', (id,))
@@ -186,8 +198,8 @@ def retry_job(id, use_current_settings=False):
         row = db.execute('SELECT * FROM jobs WHERE id=?', (id,)).fetchone()
         if row is None:
             return None
-        if row['status'] not in {'failed', 'done'}:
-            raise ValueError('Only failed or completed recordings can be retried')
+        if row['status'] not in {'failed', 'done','cancelled'}:
+            raise ValueError('Only failed, cancelled or completed recordings can be retried')
         if not Path(row['input_path']).is_file():
             raise ValueError('The original recording is missing; upload it again')
         count = db.execute("SELECT count(*) FROM jobs WHERE status IN ('queued','preparing','processing')").fetchone()[0]
@@ -197,9 +209,11 @@ def retry_job(id, use_current_settings=False):
             completed_segments=0,stage='queued',error_code=NULL,eta_seconds=NULL,started_at=NULL,finished_at=NULL,heartbeat_at=NULL,wall_s=NULL,inference_s=NULL,rtfx=NULL,updated_at=?
             WHERE id=?""", (now(), id))
         if use_current_settings:
+            from workspace_store import snapshot_options, guidance_for
             settings=get_settings()
+            db.execute('UPDATE jobs SET processing_options=?,guidance=? WHERE id=?',[json.dumps(snapshot_options(settings),ensure_ascii=False),guidance_for(settings),id])
             db.execute('''UPDATE jobs SET language=?,output_language=?,number_style=?,guidance=?,temperature=?,seed=?,segment_seconds=?,diarize=? WHERE id=?''',
-                [settings['input_language'],settings['output_language'],settings['number_style'],settings['guidance'],settings['temperature'],settings['seed'],settings['segment_seconds'],int(settings['diarize']),id])
+                [settings['input_language'],settings['output_language'],settings['number_style'],guidance_for(settings),settings['temperature'],settings['seed'],settings['segment_seconds'],int(settings['diarize']),id])
         return dict(row)
 
 
@@ -212,13 +226,22 @@ def get_settings():
 def save_settings(values):
     if not isinstance(values, dict) or not values or not values.keys() <= DEFAULTS.keys():
         raise ValueError('Unknown settings fields')
-    result = {**get_settings(), **values}
+    from workspace_store import validate_settings
+    result = validate_settings(values,get_settings())
     if isinstance(result['parallel_jobs'], bool) or not isinstance(result['parallel_jobs'], int) or not 1 <= result['parallel_jobs'] <= CAPACITY:
         raise ValueError(f'Parallel jobs must be an integer from 1 to {CAPACITY}')
     if isinstance(result['temperature'],bool) or not isinstance(result['temperature'],(int,float)) or not 0<=result['temperature']<=1:
         raise ValueError('Temperature must be a number from 0 to 1')
     if result['seed'] is not None and (isinstance(result['seed'],bool) or not isinstance(result['seed'],int) or not 0<=result['seed']<=2147483647):
         raise ValueError('Seed must be empty or an integer from 0 to 2147483647')
+    if result['chunk_mode'] not in {'fixed','silence'}:
+        raise ValueError('Chunk mode must be fixed or silence')
+    if isinstance(result['overlap_seconds'],bool) or not isinstance(result['overlap_seconds'],(int,float)) or not 0<=result['overlap_seconds']<=10:
+        raise ValueError('Chunk overlap must be from 0 to 10 seconds')
+    if result['channel_mode'] not in {'mix','separate'}:
+        raise ValueError('Channel mode must be mix or separate')
+    if not isinstance(result['vocabulary_ids'],list) or len(result['vocabulary_ids'])>20 or any(not isinstance(id,str) or len(id)>100 for id in result['vocabulary_ids']):
+        raise ValueError('Choose at most 20 vocabulary lists')
     if result['segment_seconds'] not in (60, 120, 300):
         raise ValueError('Segment length must be 60, 120 or 300 seconds')
     if result['input_language'] not in {*LANGUAGES, 'auto'} or result['output_language'] not in {*LANGUAGES, 'source'}:
@@ -328,19 +351,28 @@ def backup_database():
     for expired in sorted(directory.glob('jobs-*.sqlite3'))[:-3]:expired.unlink()
 
 
-def list_jobs_page(page=1,page_size=10,status='all',sort='newest'):
+def list_jobs_page(page=1,page_size=10,status='all',sort='newest',project=None,tag=None,archive='active'):
     orders={'newest':'created_at DESC,rowid DESC','oldest':'created_at ASC,rowid ASC',
             'name':'filename COLLATE NOCASE,created_at DESC',
             'status':"CASE status WHEN 'queued' THEN 0 WHEN 'preparing' THEN 1 WHEN 'processing' THEN 1 WHEN 'failed' THEN 3 ELSE 2 END,created_at DESC"}
-    if sort not in orders or status not in {'all','queued','processing','preparing','done','failed'}:
+    if sort not in orders or status not in {'all','queued','processing','preparing','done','failed','paused','cancelled'}:
         raise ValueError('Unsupported status or sort order')
     if not 1<=page_size<=100 or page<1:raise ValueError('Invalid pagination')
-    where,params='',[]
-    if status=='processing':where=" WHERE status IN ('preparing','processing')"
-    elif status!='all':where=' WHERE status=?';params=[status]
+    clauses,params=[],[]
+    if archive not in {'active','archived','all'}:raise ValueError('Unsupported archive filter')
+    if archive!='all':clauses.append('archived=?');params.append(int(archive=='archived'))
+    if project is not None:clauses.append('project=?');params.append(project)
+    if tag:
+        if len(tag)>80:raise ValueError('Tag is too long')
+        clauses.append('EXISTS(SELECT 1 FROM json_each(jobs.tags) WHERE value=?)');params.append(tag)
+    base_where=' WHERE '+' AND '.join(clauses) if clauses else ''
+    base_params=list(params)
+    if status=='processing':clauses.append("status IN ('preparing','processing')")
+    elif status!='all':clauses.append('status=?');params.append(status)
+    where=' WHERE '+' AND '.join(clauses) if clauses else ''
     with connection() as db:
         total=db.execute('SELECT count(*) FROM jobs'+where,params).fetchone()[0]
-        counts={row['status']:row['count'] for row in db.execute('SELECT status,count(*) AS count FROM jobs GROUP BY status')}
+        counts={row['status']:row['count'] for row in db.execute('SELECT status,count(*) AS count FROM jobs'+base_where+' GROUP BY status',base_params)}
         pages=max(1,(total+page_size-1)//page_size);page=min(page,pages)
         rows=db.execute('SELECT * FROM jobs'+where+' ORDER BY '+orders[sort]+' LIMIT ? OFFSET ?', [*params,page_size,(page-1)*page_size]).fetchall()
     return {'jobs':[_public(row) for row in rows],'total':total,'counts':counts,'page':page,'page_size':page_size,'pages':pages}

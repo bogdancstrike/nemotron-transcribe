@@ -14,7 +14,9 @@ configuration field and routes selected expert tensors through the existing
 llama.cpp CPU expert-placement helper. Mixed execution uses the standard ggml
 scheduler, not GPU-only fused serving. The timestamp patch also aligns untagged
 transcripts across all audio frames instead of restricting them to one predicted
-speaker; explicitly tagged speaker streams retain their speaker priors. The source license headers are retained.
+speaker; explicitly tagged speaker streams retain their speaker priors. The
+encoder/CTC-only alignment endpoint accepts analyst text and generates genuine
+word times without running LLM transcription or inventing timing intervals. The source license headers are retained.
 The Apache-2.0 license and distribution conditions were inspected for this
 source-only patch; this is a technical license review, not legal certification.
 

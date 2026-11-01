@@ -13,7 +13,7 @@ Built for **RTX 3080 10 GB + 64 GB RAM**, with a reproducible CPU baseline and e
 ![Romanian](https://img.shields.io/badge/Romanian-UTF--8-7656a8?style=flat-square)
 ![Model](https://img.shields.io/badge/model-IQ4__NL-555?style=flat-square)
 
-[Quick start](#quick-start) · [The studio](#the-studio) · [Measured performance](#measured-performance) · [Hardware](#hardware-and-offloading) · [Operations](#operations)
+[Quick start](#quick-start) · [The studio](#the-studio) · [Measured performance](#measured-performance) · [Hardware](#hardware-and-offloading) · [Operations](#operations) · [Remaining tasks & acceptance criteria](docs/tasks.md)
 
 </div>
 
@@ -26,16 +26,16 @@ Seven focused pages. One local workspace.
 | Tab | What you get |
 | :--- | :--- |
 | **Upload** | A wide, centered file chooser. M4A first, plus MP4, WAV, MP3, FLAC and more. Multiple uploads, real upload progress, and automatic navigation to the new file. |
-| **Files** | Status views, server-side pagination (10 rows by default), added/started/ended timestamps, progress, ETA, processing time, RTF/RTFx, queue pause/resume and retry with original or current settings. |
+| **Files** | Projects, labels, archive views, bulk actions, 10-row server pagination, timestamps, RTF/RTFx, queue/file ETAs, and individual pause/resume/cancel. Uploads resume after interruption. |
 | **Player** | Audio/video beside the full transcript. Matched words follow real model alignment. Click to seek, view/filter speakers, adjust playback-only sync offset, and change speed or automatic scrolling. |
-| **Statistics** | Per-file and aggregate processing time, RTF and RTFx. Totals use summed audio and processing times. |
-| **Corrections** | A compact editable transcript with live spoken-word highlighting, click-to-seek, a right-click playback menu, find/replace, undo/redo, autosave, revision protection, TXT/JSON export and local draft recovery. |
+| **Statistics** | Per-file and aggregate RTF/RTFx, an accuracy lab using verified references, retained-run comparisons and profile variants. |
+| **Corrections** | Editable word sync, real waveforms, A–B loops, passage-aware contextual actions, named/editable speakers, reviewed ranges, real corrected-text alignment, document/audio exports and draft recovery. |
 | **Info** | Deployment revisions, every accepted file type, host CPU/RAM, model RSS, storage and GPU memory, load, power and temperature. |
-| **Settings** | Parallel processing levels 1, 2, 4, 8, 16 or custom within capacity; chunk size, input/output languages, temperature, sampling seed, guidance examples, number formatting and speaker defaults. |
+| **Settings** | Named profiles, vocabulary lists, parallel processing, silence-aware chunks, boundary overlap/context, separate audio channels, languages, decoding controls and editable guidance. |
 
 **Romanian by default.** Diacritics remain intact throughout upload, transcription, playback and export. Choose an input language or automatic detection, independently of the output language. Keep the spoken language or request a translation. Optional speaker identification uses one stateful encoder pass over the complete file, with consistent file-wide IDs (up to 60 minutes). Important numeric values can be requested as digits; always verify critical amounts against the recording.
 
-**No invented timestamps.** Matching words can follow genuine model timestamps even when other text is unaligned. Untimed text remains readable. Complete SRT is exported only when alignment covers the full transcript. Unchanged words in analyst edits can retain their original timing; new or changed words stay untimed. Translations may have no word timing.
+**No invented timestamps.** Matching words can follow genuine model timestamps even when other text is unaligned. Untimed text remains readable. Complete SRT is exported only when alignment covers the full transcript. Unchanged review words retain original timing. New or changed words stay untimed until an analyst requests genuine encoder/CTC realignment against the recording. Translations may have no word timing.
 
 ## Screenshots
 
@@ -198,7 +198,7 @@ Files live in `./data`; models live in `./models`. Neither directory is tracked.
 
 The worker sends a heartbeat and records preparation, transcription, file-wide speaker identification and export stages. Files flags disconnected workers and preserves saved progress. Remaining-time estimates use the last five completed chunks and adapt to current model contention; they are hidden when stale or unavailable. No ETA is fabricated before the first completed chunk. SIGTERM finishes the current model request, checkpoints it, and requeues remaining work. Docker allows a two-minute graceful stop; a hard kill can require repeating the in-flight chunk.
 
-Daily SQLite snapshots are created in `data/backups/` with the latest three snapshots retained. These back up **job/settings/review metadata**; protect `data/uploads/` and `data/results/` separately. To restore, stop web and worker, back up the current database and its WAL/SHM files, then replace the database with a snapshot and remove the obsolete WAL/SHM files before restarting. Restoring an older snapshot also restores older review revisions.
+Daily SQLite snapshots are created in `data/backups/` with the latest three snapshots retained. These back up **job/settings/review metadata, profiles, retained-run snapshots and evaluation records**; protect `data/uploads/` and `data/results/` separately. To restore, stop web and worker, back up the current database and its WAL/SHM files, then replace the database with a snapshot and remove the obsolete WAL/SHM files before restarting. Restoring an older snapshot also restores older review revisions.
 
 The UI binds only to **127.0.0.1**. The inference service has **no published host port**. This is a single-user local tool; public access needs a real authentication/reverse-proxy design.
 
@@ -218,7 +218,7 @@ uv pip install --python .venv/bin/python -r app/requirements.txt pytest pyyaml p
 # Add --reference reference.txt to compute Romanian WER/CER.
 ```
 
-The application suite currently passes **73 tests**, including checkpoint recovery, failed/completed-file retries, model-disconnect recovery, actual FFmpeg conversion of a synthetic 60-minute MP4, queue recovery and locking, Unicode exports, byte-range playback, invalid alignment, bounded retries and OOM handling. That long-file test uses mocked inference. Browser checks separately exercise all seven routes, mobile layout, real media seeking/highlighting, correction autosave/export/offline drafts, and the keyboard-accessible contextual menu. A real three-minute M4A test verified live ETA, nonzero temperature, seeded sampling, queue pause, graceful worker restart and reuse of two saved chunks. A separate two-chunk recording exercised the complete-file speaker pass. Raw local evidence is stored under `evidence/` and excluded from Git because it can contain recordings and transcripts.
+The application suite currently passes **115 tests**, including checkpoint recovery, failed/completed-file retries, model-disconnect recovery, actual FFmpeg conversion of a synthetic 60-minute MP4, queue recovery and locking, Unicode exports, byte-range playback, invalid alignment, bounded retries and OOM handling. That long-file test uses mocked inference. Browser checks separately exercise all seven routes, mobile layout, real media seeking/highlighting, correction autosave/export/offline drafts, and the keyboard-accessible contextual menu. A real three-minute M4A test verified live ETA, nonzero temperature, seeded sampling, queue pause, graceful worker restart and reuse of two saved chunks. Further real-model tests verified silence-aware boundaries and overlap on 117 seconds of speech, independent stereo-channel transcripts with one shared 30-second timeline, and corrected-text CTC alignment for all 331 words of the longer fixture. Individual pause/resume reused two saved chunks; cancellation preserved its source. Browser checks also exercise multiword selection, passage playback/loops, document/audio exports, speaker edits, review state, profiles and comparisons. Raw local evidence is stored under `evidence/` and excluded from Git because it can contain recordings and transcripts.
 
 ## Architecture
 
@@ -240,7 +240,7 @@ flowchart LR
 - Pages have real URLs: `/upload`, `/files`, `/player`, `/statistics`, `/corrections`, `/info`, `/settings`. Reload and browser Back/Forward keep your place. Player and Corrections URLs retain the selected recording.
 - Upload accepts **M4A, MP4, MP4A, WAV, MP3, FLAC, MKV, WEBM, MOV, AVI, OGG, OPUS and AAC**. FFprobe validates the actual audio stream; an extension alone is not enough.
 - Files and Statistics use bounded server-side pages, starting at **10 rows per page**. Files can be filtered by queued, transcribing, completed or failed status, and sorted independently. Every record shows when it was added, started and ended alongside processing time, RTF and RTFx. Timestamps use your browser’s local timezone; hover for the full date.
-- Corrections keep the original model transcript intact. Reviewed text has revision checks, autosave and per-tab draft recovery. A compact toolbar offers undo/redo, find-and-replace, playback-time insertion and number checks. Click an unchanged timed word to seek; the current spoken word highlights while editing without moving your caret. Right-click for play/replay, find, copy and timestamp insertion. New text receives no invented alignment. It exports as TXT/JSON without attaching old word timing to changed words.
+- Corrections keep the original model transcript intact. Reviewed text has revision checks, autosave and per-tab draft recovery. A compact toolbar offers undo/redo, find-and-replace, playback-time insertion and number checks. Click an unchanged timed word to seek; the current spoken word highlights while editing without moving your caret. Right-click for play/replay, find, copy and timestamp insertion. New text receives no invented alignment. Exports include TXT/JSON, Unicode DOCX/PDF, WebVTT when complete real timing exists, and bounded WAV excerpts for timed selections.
 - Higher concurrency shares the same model and memory pool. It can increase total throughput while reducing each file's speed. Settings never start a second model instance.
 
 ### Tune the transcript
@@ -254,6 +254,10 @@ Settings includes **Reliable** (1 file, 60-second chunks), **Balanced** (2 files
 | Temperature | `0` uses greedy decoding; `0–1` allows sampled alternatives. Higher values can reduce consistency. |
 | Sampling seed | Optional integer for seeded sampling. Has no effect on greedy decoding. |
 | Segment length | 60, 120 or 300 seconds. Shorter segments give faster feedback; longer ones supply more context. |
+| Chunk boundaries | Fixed length or a nearby silence boundary, with exact sample coverage. |
+| Boundary context | 0–10 seconds of look-behind audio, plus limited previous text for spelling/context; owned words retain their original timeline. |
+| Audio channels | Mix to mono or transcribe channels independently. Channel IDs remain distinct and recording duration is counted once. |
+| Profiles / vocabulary | Save reusable settings and contextual terms; upload sessions snapshot resolved instructions so later edits cannot change a queued job. |
 | Numbers | Ask for conventional digits or natural wording. |
 | Speakers | A separate encoder pass identifies speakers across the entire recording; it does not rely on chunk-local slot numbers. |
 | Guidance | Editable instructions, with examples for verbatim speech, readable text, names/places, technical vocabulary, amounts/dates and mixed languages. Available per upload too. |
@@ -264,9 +268,33 @@ The stock speaker prompt can spell numeric punctuation incorrectly. The digits i
 
 Speaker control tags are removed from readable transcripts; raw responses remain available in JSON. One complete-file speaker pass assigns word speakers by real temporal overlap. Existing results with chunk-local IDs remain identified as legacy results until retried. The current runtime limits speaker-enabled recordings to **60 minutes**; longer recordings remain supported with speaker identification disabled.
 
+## Review a passage, not a wall of controls
+
+Drag across one or more transcript words, then right-click (or use **Shift+F10**). The menu adapts to the selection: **Play selection**, **Loop selection**, mark reviewed/unreviewed, assign a speaker, realign, or export the selected text as TXT/DOCX/PDF and its audio as WAV. Playback stops at genuine aligned boundaries. Words without reliable timing can still be edited/exported; choose a waveform interval when requesting alignment for newly corrected text.
+
+The waveform is computed from the recording, with bounded peak data sent to the browser. Click to seek, drag an audio range, or use keyboard controls. Speaker tools let you rename identities, merge them, or split selected words into a new speaker. These are reversible analyst annotations; raw model responses and original media remain untouched. Reviewed intervals persist and overlapping ranges count once.
+
+### Realignment and exports
+
+**Realign transcript** queues an encoder/CTC pass using your saved wording and the audio. It does not ask the LLM to regenerate the text and does not interpolate timestamps. Tasks survive worker restarts and reject stale revisions. Successful alignment enables seeking/highlighting of corrected words and reviewed WebVTT subtitles. Incorrect or unalignable text can fail clearly; narrow the passage and verify the recording.
+
+Files offers **Export document…** for original/reviewed TXT, JSON, DOCX, PDF and WebVTT. Romanian characters remain intact. Speaker-separated exports use saved speaker names and retain unaligned text. Select several files for ZIP export; any export failures are described inside the ZIP rather than silently omitted.
+
+### Compare settings and measure accuracy
+
+Open **Statistics → Accuracy lab & comparisons**, or choose the corresponding action from Files. **Create a comparison run** copies the original recording safely and snapshots a chosen profile. Current variants and retained results appear in the same comparison family, with text differences and real settings/timing metrics side by side. Retrying retains the previous completed result before replacing it.
+
+Accuracy evaluation requires a **human-reviewed reference for the same audio**. The lab stores WER/CER, edit counts, normalization, source settings and processing metrics. It flags a reference identical to the model transcript; zero error against copied model output is not an accuracy measurement. No corpus-wide Romanian accuracy claim is made without independent references.
+
+### Resumable uploads and library controls
+
+Uploads transfer in bounded chunks and persist verified offsets. After a lost connection or page reload, select the same file to continue; finalization is idempotent. Profiles, vocabulary and processing options are snapshotted when upload begins.
+
+Use Projects, labels and Archive to organize recordings. Select files for bulk retry, organize, archive, export, pause/resume, cancellation or deletion. Pause/cancel takes effect at a safe chunk boundary; originals and completed chunks are preserved. Queue estimates use observed processing speed, active progress and configured concurrency, and disappear when the queue/model is unavailable.
+
 ## Current limits
 
-- Word timing depends on the model’s alignment and can be incomplete. A collapsed alignment that ends substantially before model-detected speech is withheld from highlighting. Changed review words do not inherit old timestamps.
+- Word timing depends on the model’s alignment and can be incomplete. A collapsed alignment that ends substantially before model-detected speech is withheld from highlighting. Changed review words need genuine CTC realignment before they acquire timing. Realignment accepts a full saved transcript or a passage up to 60 minutes; it runs when file transcription is idle.
 - File-wide speaker identification is limited to 60 minutes by the pinned runtime. Speaker labels are model predictions, not verified identities; overlapping or similar voices can still be confused.
 - Translated output may have no usable word alignment or speaker labels.
 - Concurrency above one shares a fixed model pool and does not guarantee higher throughput. Default concurrency is one; this deployment uses one worker host and one SQLite data directory.

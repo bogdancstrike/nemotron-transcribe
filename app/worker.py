@@ -28,6 +28,7 @@ from settings import CAPACITY, LANGUAGES
 from media import probe_audio
 from transcript import readable_text
 from diarization import assign_speakers, diarize_file, MAX_SPEAKER_SECONDS
+from processing import normalize_options, DEFAULT_OPTIONS, prepare_audio, trim_context
 
 LOG = logging.getLogger('worker')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -38,6 +39,14 @@ STOP = threading.Event()
 
 
 class JobInterrupted(RuntimeError):
+    pass
+
+
+class JobPaused(JobInterrupted):
+    pass
+
+
+class JobCancelled(JobInterrupted):
     pass
 
 
@@ -62,7 +71,8 @@ def timing_suspect(segment):
     words=segment.get('words') or []
     turns=(segment.get('raw_response') or {}).get('diarization_timestamps') or []
     if len(words)<20 or not turns:return False
-    speech_end=max((t.get('end',0) for t in turns if isinstance(t,dict) and isinstance(t.get('end'),(int,float))),default=0)
+    speech_end=max(0,max((t.get('end',0) for t in turns if isinstance(t,dict) and isinstance(t.get('end'),(int,float))),default=0)-segment.get('context_offset_seconds',0))
+    if 'context_offset_seconds' in segment:speech_end=min(segment.get('duration_s',speech_end),speech_end)
     aligned_end=max((w.get('end',0) for w in words if isinstance(w,dict) and isinstance(w.get('end'),(int,float))),default=0)
     return speech_end-aligned_end>5 and aligned_end<speech_end*.75
 
@@ -130,6 +140,7 @@ def srt_from_segments(segments: list) -> str:
         if group:
             cues.append((offset + group[0]['start'], offset + max(w['end'] for w in group),
                          ' '.join(w['word'].strip() for w in group)))
+    cues.sort(key=lambda cue:cue[0])
     return '\n\n'.join(f'{i}\n{fmt_time(start)} --> {fmt_time(end)}\n{text}'
                         for i, (start, end, text) in enumerate(cues, 1)) + ('\n' if cues else '')
 
@@ -279,118 +290,126 @@ def with_engine_recovery(operation, id, stage):
     raise RuntimeError('Model disconnected repeatedly')
 
 
+def check_control(id):
+    with db.connection() as connection:
+        row=connection.execute('SELECT * FROM jobs WHERE id=?',(id,)).fetchone()
+    if row:
+        action=dict(row).get('control_action')
+        if action=='pause':raise JobPaused('Paused at a saved chunk boundary')
+        if action=='cancel':raise JobCancelled('Cancelled; original recording and saved chunks are preserved')
+
+
+def finish_control(id,status):
+    with db.connection() as connection:
+        connection.execute("UPDATE jobs SET status=?,stage=?,control_action=NULL,eta_seconds=NULL,error=NULL,finished_at=?,updated_at=? WHERE id=?",(status,status,db.now() if status=='cancelled' else None,db.now(),id))
+
+
 def do_job(job: dict):
-    id = job['id']
-    started = time.perf_counter()
+    id=job['id'];started=time.perf_counter()
+    check_control(id)
     update_job(id,stage='preparing',heartbeat_at=db.now())
-    LOG.info('Job %s: %s', id, job['filename'])
-    outdir = OUT / id
-    outdir.mkdir(parents=True, exist_ok=True)
-    # Never expose leftover exports on a recovered attempt.
-    for path in outdir.glob('transcript.*'):
-        path.unlink()
-    temp_root = DATA / 'tmp'
-    temp_root.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=id + '-', dir=temp_root) as temp:
-        chunks = prepare_segments(job['input_path'], Path(temp), job['segment_seconds'])
-        chunk_durations=[pcm_duration(path) for path in chunks]
-        update_job(id, status='processing',stage='transcribing', total_segments=len(chunks))
-        segments, cumulative_offset, inference_s = [], 0.0, 0.0
-        source = Path(job['input_path']).stat()
-        signature = {'size':source.st_size, 'mtime_ns':source.st_mtime_ns,
-                     'language':job['language'], 'diarize':bool(job['diarize']),
-                     'segment_seconds':job['segment_seconds'], 'output_language':job.get('output_language','source'), 'number_style':job.get('number_style','natural'), 'backend':os.getenv('NEMO_MODE','cpu'),
-                     'patch_commit':os.getenv('NEMO_PATCH_COMMIT','')}
-        if job.get('number_style','natural') != 'natural' or job['diarize']:
-            signature['transcription_policy'] = 'file-speakers-v1' if job['diarize'] else 'readable-numbers-v1'
-            signature['number_style'] = job.get('number_style','natural')
-        if job.get('guidance','').strip():
-            signature['guidance'] = job['guidance'].strip()
+    LOG.info('Job %s: %s',id,job['filename'])
+    outdir=OUT/id;outdir.mkdir(parents=True,exist_ok=True)
+    from workspace_store import archive_run
+    archive_run(id,OUT)
+    for path in outdir.glob('transcript.*'):path.unlink()
+    options=normalize_options(job.get('processing_options'))
+    advanced=any(options[key]!=value for key,value in DEFAULT_OPTIONS.items())
+    guidance=job.get('guidance','')
+    if options['vocabulary'] and 'Context vocabulary:' not in guidance:
+        guidance=(guidance+' Context vocabulary (use only if supported by the audio): '+', '.join(options['vocabulary']))[:4000]
+    temp_root=DATA/'tmp';temp_root.mkdir(parents=True,exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=id+'-',dir=temp_root) as temp:
+        if advanced:
+            audio=prepare_audio(job['input_path'],Path(temp),job['segment_seconds'],options)
+            plan=audio.chunks;file_duration=audio.duration_s;diarization_chunks=[audio.full_audio]
+        else:
+            chunks=prepare_segments(job['input_path'],Path(temp),job['segment_seconds'])
+            plan=[];offset=0.
+            for path in chunks:
+                duration=pcm_duration(path)
+                plan.append({'path':path,'start_seconds':offset,'core_start_seconds':offset,'core_end_seconds':offset+duration,'duration_s':duration,'channel':None})
+                offset+=duration
+            file_duration=offset;diarization_chunks=chunks
+        core_durations=[part['core_end_seconds']-part['core_start_seconds'] for part in plan]
+        update_job(id,status='processing',stage='transcribing',total_segments=len(plan))
+        segments=[];inference_s=0.;source=Path(job['input_path']).stat()
+        signature={'size':source.st_size,'mtime_ns':source.st_mtime_ns,'language':job['language'],'diarize':bool(job['diarize']),
+                   'segment_seconds':job['segment_seconds'],'output_language':job.get('output_language','source'),
+                   'number_style':job.get('number_style','natural'),'backend':os.getenv('NEMO_MODE','cpu'),'patch_commit':os.getenv('NEMO_PATCH_COMMIT','')}
+        if job.get('number_style','natural')!='natural' or job['diarize']:
+            signature['transcription_policy']='file-speakers-v1' if job['diarize'] else 'readable-numbers-v1'
+        if guidance.strip():signature['guidance']=guidance.strip()
         if job.get('temperature',0):signature['temperature']=job['temperature']
         if job.get('seed') is not None:signature['seed']=job['seed']
-        checkpoint = outdir / 'checkpoint.json'
-        prior_wall = 0.0
+        if advanced or options['vocabulary']:signature['processing_options']=options
+        checkpoint=outdir/'checkpoint.json';prior_wall=0.
         try:
-            saved = json.loads(checkpoint.read_text())
-            saved['signature'].setdefault('output_language', 'source')
-            saved['signature'].setdefault('number_style', 'natural')
-            if saved['signature'] == signature and isinstance(saved['segments'], list) and len(saved['segments']) <= len(chunks):
-                candidate = saved['segments']
-                offset = 0.0
-                for index, segment in enumerate(candidate):
-                    if segment['index'] != index or abs(segment['start_seconds'] - offset) > 1/16000 or abs(segment['duration_s'] - pcm_duration(chunks[index])) > 1/16000:
+            saved=json.loads(checkpoint.read_text());saved['signature'].setdefault('output_language','source');saved['signature'].setdefault('number_style','natural')
+            if saved['signature']==signature and isinstance(saved['segments'],list) and len(saved['segments'])<=len(plan):
+                for index,segment in enumerate(saved['segments']):
+                    if (segment['index']!=index or abs(segment['start_seconds']-plan[index]['core_start_seconds'])>1/16000
+                        or abs(segment['duration_s']-core_durations[index])>1/16000 or segment.get('channel')!=plan[index]['channel']):
                         raise ValueError('Checkpoint does not match PCM segments')
-                    offset += segment['duration_s']
-                segments = candidate
-                cumulative_offset = offset
-                inference_s = sum(segment['inference_s'] for segment in segments)
-                prior_wall = float(saved['wall_s'])
-                LOG.info('Resuming %s after %d completed segments', id, len(segments))
-        except (OSError, ValueError, KeyError, TypeError):
-            LOG.info('No compatible checkpoint for %s; starting at the first segment', id)
-        if checkpoint.exists() and not segments:
-            checkpoint.replace(outdir / f'checkpoint-superseded-{time.time_ns()}.json')
-        update_job(id, completed_segments=len(segments), progress=min(99, round(100*len(segments)/len(chunks))))
-        for n, path in enumerate(chunks):
-            if n < len(segments):
-                continue
+                segments=saved['segments'];inference_s=sum(part['inference_s'] for part in segments);prior_wall=float(saved['wall_s'])
+                LOG.info('Resuming %s after %d completed segments',id,len(segments))
+        except (OSError,ValueError,KeyError,TypeError):LOG.info('No compatible checkpoint for %s; starting at the first segment',id)
+        if checkpoint.exists() and not segments:checkpoint.replace(outdir/f'checkpoint-superseded-{time.time_ns()}.json')
+        update_job(id,completed_segments=len(segments),progress=min(99,round(100*len(segments)/len(plan))))
+        for n,part in enumerate(plan):
+            if n<len(segments):continue
+            check_control(id)
             if STOP.is_set():raise JobInterrupted('Worker is restarting; saved chunks will resume')
-            duration = chunk_durations[n]
             update_job(id,stage='transcribing',segment_started_at=db.now())
-            segment_started = time.perf_counter()
-            interval_started = db.now()
-            result = with_engine_recovery(lambda: transcribe_chunk(path, job['language'], bool(job['diarize']), job.get('output_language','source'), job.get('number_style','natural'), job.get('guidance',''), job.get('temperature',0.0), job.get('seed')),id,'transcribing')
-            db.record_interval(id, interval_started, db.now())
-            wall = time.perf_counter() - segment_started
-            inference_s += wall
-            segment = {'index': n, 'start_seconds': cumulative_offset, 'duration_s': duration,
-                       'inference_s': wall, 'rtfx': duration / wall if wall else None,
-                       'text': readable_text(result['text']), 'words': [dict(w) for w in result.get('words') or []],
-                       'language': result.get('language'), 'raw_response': result}
-            segment['alignment_valid'] = valid_alignment(segment)
-            segment['playback_words'] = playback_words(segment)
-            segments.append(segment)
-            cumulative_offset += duration
-            elapsed = prior_wall + time.perf_counter() - started
-            atomic_text(checkpoint, json.dumps({'signature':signature, 'segments':segments, 'wall_s':elapsed}, ensure_ascii=False))
-            estimate=estimate_remaining(segments,sum(chunk_durations[n+1:]))
+            segment_started=time.perf_counter();interval_started=db.now();request_guidance=guidance
+            previous=next((segment for segment in reversed(segments) if segment.get('channel')==part['channel']),None)
+            if options['overlap_seconds'] and previous:
+                request_guidance=(guidance+' Context from the previous passage for spelling and continuity only; do not add it unless audible: '+previous['text'][-600:])[:4000]
+            raw=with_engine_recovery(lambda:transcribe_chunk(part['path'],job['language'],bool(job['diarize']),job.get('output_language','source'),job.get('number_style','natural'),request_guidance,job.get('temperature',0.),job.get('seed')),id,'transcribing')
+            db.record_interval(id,interval_started,db.now());wall=time.perf_counter()-segment_started;inference_s+=wall
+            context_offset=part['core_start_seconds']-part['start_seconds'];duration=core_durations[n]
+            result=trim_context(raw,context_offset,duration,previous['text'] if previous else '') if advanced else raw
+            segment={'index':n,'start_seconds':part['core_start_seconds'],'duration_s':duration,'inference_s':wall,
+                     'rtfx':duration/wall if wall else None,'text':readable_text(result['text']),'words':[dict(w) for w in result.get('words') or []],
+                     'language':result.get('language'),'raw_response':raw}
+            if advanced:segment.update(channel=part['channel'],context_offset_seconds=context_offset,request_start_seconds=part['start_seconds'])
+            if part['channel'] is not None:
+                for word in segment['words']:word['speaker']=part['channel']
+            segment['alignment_valid']=valid_alignment(segment);segment['playback_words']=playback_words(segment);segments.append(segment)
+            elapsed=prior_wall+time.perf_counter()-started
+            atomic_text(checkpoint,json.dumps({'signature':signature,'segments':segments,'wall_s':elapsed},ensure_ascii=False))
+            estimate=estimate_remaining(segments,sum(core_durations[n+1:]))
             eta={'eta_seconds':estimate['seconds'],'eta_low_s':estimate['low'],'eta_high_s':estimate['high'],'eta_samples':estimate['samples'],'eta_updated_at':db.now()} if estimate else {'eta_seconds':None}
-            update_job(id, **eta, completed_segments=n + 1, progress=min(99, round(100 * (n + 1) / len(chunks))),
-                       wall_s=elapsed, inference_s=inference_s, rtfx=cumulative_offset / elapsed)
-        if job['diarize']:
+            processed=max(part['core_end_seconds'] for part in plan[:n+1])
+            update_job(id,**eta,completed_segments=n+1,progress=min(99,round(100*(n+1)/len(plan))),wall_s=elapsed,inference_s=inference_s,rtfx=processed/elapsed)
+            check_control(id)
+        check_control(id)
+        if job['diarize'] and options['channel_mode']!='separate':
             if STOP.is_set():raise JobInterrupted('Worker is restarting; saved chunks will resume')
-            if sum(chunk_durations)>MAX_SPEAKER_SECONDS+.1:
-                raise RuntimeError('File-wide speaker identification supports recordings up to 60 minutes in this runtime. Disable speakers for longer recordings.')
+            if file_duration>MAX_SPEAKER_SECONDS+.1:raise RuntimeError('File-wide speaker identification supports recordings up to 60 minutes; disable it for longer recordings')
             update_job(id,stage='identifying_speakers',eta_seconds=None)
             speaker_started=time.perf_counter();speaker_interval=db.now()
-            turns=with_engine_recovery(lambda:diarize_file(chunks,Path(temp)/'speakers.wav',NEMO),id,'identifying_speakers')
-            inference_s+=time.perf_counter()-speaker_started
-            db.record_interval(id,speaker_interval,db.now())
-            assign_speakers(segments,turns)
+            turns=with_engine_recovery(lambda:diarize_file(diarization_chunks,Path(temp)/'speakers.wav',NEMO),id,'identifying_speakers')
+            inference_s+=time.perf_counter()-speaker_started;db.record_interval(id,speaker_interval,db.now());assign_speakers(segments,turns)
             for segment in segments:segment['playback_words']=playback_words(segment)
         else:turns=[]
-        update_job(id,stage='exporting',eta_seconds=None)
-        combined = '\n\n'.join(s['text'].strip() for s in segments if s['text'].strip())
-        atomic_text(outdir / 'transcript.txt', combined + ('\n' if combined else ''))
-        srt = srt_from_segments(segments)
-        if srt:
-            atomic_text(outdir / 'transcript.srt', srt)
-        wall_s = prior_wall + time.perf_counter() - started
-        metadata = {'job_id': id, 'original_filename': job['filename'], 'language_hint': job['language'],
-                    'diarization_requested': bool(job['diarize']), 'speaker_scope': 'file' if job['diarize'] else None, 'speaker_turns':turns,
-                    'output_language':job.get('output_language','source'), 'number_style':job.get('number_style','natural'),
-                    'guidance':job.get('guidance',''), 'temperature':job.get('temperature',0.0), 'seed':job.get('seed'),
-                    'timestamp_source': 'model_word_alignment' if srt else 'unavailable',
-                    'srt_available': bool(srt), 'duration_s': cumulative_offset, 'wall_s': wall_s,
-                    'inference_s': inference_s, 'rtfx': cumulative_offset / wall_s,
-                    'inference_rtfx': cumulative_offset / inference_s if inference_s else None,
-                    'backend': os.getenv('NEMO_MODE', 'cpu'),
-                    'segments': segments, 'text': combined}
-        atomic_text(outdir / 'transcript.json', json.dumps(metadata, ensure_ascii=False, indent=2) + '\n')
-        checkpoint.unlink(missing_ok=True)
-        update_job(id, status='done',stage='done',finished_at=db.now(),eta_seconds=None, progress=100, duration_s=cumulative_offset, wall_s=wall_s,
-                   inference_s=inference_s, rtfx=metadata['rtfx'])
-    LOG.info('Finished job %s', id)
+        check_control(id);update_job(id,stage='exporting',eta_seconds=None)
+        combined='\n\n'.join(segment['text'].strip() for segment in segments if segment['text'].strip())
+        atomic_text(outdir/'transcript.txt',combined+('\n' if combined else ''));srt=srt_from_segments(segments)
+        if srt:atomic_text(outdir/'transcript.srt',srt)
+        wall_s=prior_wall+time.perf_counter()-started
+        metadata={'job_id':id,'original_filename':job['filename'],'language_hint':job['language'],'diarization_requested':bool(job['diarize']),
+                  'speaker_scope':'file' if job['diarize'] or options['channel_mode']=='separate' else None,'speaker_turns':turns,
+                  'speaker_source':'audio_channels' if options['channel_mode']=='separate' else 'model' if job['diarize'] else None,
+                  'channel_count':audio.channels if advanced else 1,'processing_options':options,
+                  'output_language':job.get('output_language','source'),'number_style':job.get('number_style','natural'),
+                  'guidance':guidance,'temperature':job.get('temperature',0.),'seed':job.get('seed'),'timestamp_source':'model_word_alignment' if srt else 'unavailable',
+                  'srt_available':bool(srt),'duration_s':file_duration,'wall_s':wall_s,'inference_s':inference_s,'rtfx':file_duration/wall_s,
+                  'inference_rtfx':file_duration/inference_s if inference_s else None,'backend':os.getenv('NEMO_MODE','cpu'),'segments':segments,'text':combined}
+        atomic_text(outdir/'transcript.json',json.dumps(metadata,ensure_ascii=False,indent=2)+'\n');checkpoint.unlink(missing_ok=True)
+        update_job(id,status='done',stage='done',finished_at=db.now(),eta_seconds=None,progress=100,duration_s=file_duration,wall_s=wall_s,inference_s=inference_s,rtfx=metadata['rtfx'])
+        with db.connection() as connection:connection.execute('UPDATE jobs SET control_action=NULL WHERE id=?',(id,))
+    LOG.info('Finished job %s',id)
 
 
 @contextmanager
@@ -442,17 +461,25 @@ def main():
         init_db()
         safe_backup()
         recover_jobs()
+        import alignment
+        alignment.init_schema();alignment.recover_tasks()
         OUT.mkdir(parents=True, exist_ok=True)
         shutil.rmtree(DATA / 'tmp', ignore_errors=True)
         last_prune=last_heartbeat=0
         ready=False
         with ThreadPoolExecutor(max_workers=CAPACITY,thread_name_prefix='file') as pool:
-            futures={}
-            while futures or not STOP.is_set():
+            futures={};alignment_future=None
+            while futures or alignment_future or not STOP.is_set():
+                if alignment_future is not None and alignment_future.done():
+                    alignment_future.result();alignment_future=None
                 for future in list(futures):
                     if future.done():
                         job=futures.pop(future)
                         try:future.result()
+                        except JobPaused:
+                            finish_control(job['id'],'paused')
+                        except JobCancelled:
+                            finish_control(job['id'],'cancelled')
                         except JobInterrupted:
                             update_job(job['id'],status='queued',stage='recovering',eta_seconds=None,error=None)
                         except Exception as exc:
@@ -464,7 +491,10 @@ def main():
                 if time.monotonic()-last_heartbeat>=2:
                     db.worker_heartbeat([job['id'] for job in futures.values()],ready,STOP.is_set());last_heartbeat=time.monotonic()
                 settings=db.get_settings()
-                if not STOP.is_set() and not settings['queue_paused'] and len(futures)<settings['parallel_jobs'] and ready:
+                if not STOP.is_set() and not futures and alignment_future is None and ready:
+                    task=alignment.claim_task()
+                    if task:alignment_future=pool.submit(alignment.run_task,task,NEMO)
+                if not STOP.is_set() and alignment_future is None and not settings['queue_paused'] and len(futures)<settings['parallel_jobs'] and ready:
                     job=claim_job(settings['parallel_jobs'])
                     if job:
                         futures[pool.submit(do_job,job)]=job

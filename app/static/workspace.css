@@ -1,0 +1,345 @@
+/* Restrained controls for library and reusable transcription workflows. */
+.library-toolbar {
+  display: flex;
+  align-items: end;
+  gap: 18px;
+  flex-wrap: wrap;
+  margin: 22px 0 14px;
+}
+.library-toolbar label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 10px;
+}
+.library-toolbar select,
+.library-toolbar input {
+  margin: 0;
+  width: 165px;
+  font-size: 11px;
+  border: 1px solid var(--line);
+  background: #fff;
+  border-radius: 7px;
+  padding: 8px 10px;
+}
+.library-eta {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--muted);
+  padding-bottom: 8px;
+}
+.bulk-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 10px;
+  margin: 0 0 14px;
+  color: var(--muted);
+  min-height: 30px;
+}
+.bulk-toolbar select {
+  width: 190px;
+  margin: 0;
+  font-size: 10px;
+  padding: 6px 9px;
+}
+.bulk-toolbar button {
+  font-size: 10px;
+  padding: 6px 10px;
+}
+.bulk-toolbar:not(.has-selection) > :not(.bulk-select) {
+  display: none;
+}
+.bulk-select {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+.file-select,
+.bulk-select input {
+  accent-color: var(--accent);
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.file-select {
+  margin-top: 8px;
+}
+.file-labels {
+  color: #637182;
+  font-size: 10px;
+  margin: 5px 0 0;
+}
+.status.paused {
+  color: #927321;
+  background: #faf4e3;
+}
+.status.cancelled {
+  color: #73737b;
+  background: #ededf1;
+}
+.workspace-dialog {
+  width: min(600px, calc(100vw - 32px));
+  max-height: 90dvh;
+  padding: 27px;
+  border: 1px solid var(--line);
+  border-radius: 15px;
+  background: #fff;
+  box-shadow: 0 20px 100px #0002;
+  color: var(--text);
+  overflow: auto;
+}
+.workspace-dialog::backdrop {
+  background: #17172040;
+  backdrop-filter: blur(3px);
+}
+.workspace-dialog .dialog-heading {
+  margin-bottom: 23px;
+}
+.workspace-dialog h2 {
+  font-size: 19px;
+}
+.workspace-dialog > button {
+  margin-top: 18px;
+}
+.workspace-dialog .quiet {
+  font-size: 12px;
+  line-height: 1.7;
+  margin: 15px 0;
+}
+.workspace-field {
+  display: grid;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--muted);
+  margin: 16px 0;
+}
+.workspace-field input,
+.workspace-field select,
+.workspace-field textarea {
+  width: 100%;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+  padding: 10px 12px;
+  color: var(--text);
+  font: 12px/1.6 var(--font);
+}
+.workspace-field input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+.workspace-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 16px 0 3px;
+}
+.workspace-actions button {
+  font-size: 11px;
+  padding: 8px 12px;
+}
+.workspace-details {
+  margin-top: 20px;
+  border-top: 1px solid var(--line);
+  padding-top: 15px;
+}
+.workspace-details > summary {
+  font-size: 12px;
+  cursor: pointer;
+  color: var(--muted);
+}
+.workspace-card .quiet {
+  line-height: 1.7;
+}
+.workspace-card select[multiple] {
+  min-height: 90px;
+}
+.workspace-card textarea {
+  resize: vertical;
+}
+.upload-profile {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 18px;
+}
+.upload-profile select {
+  width: 200px;
+  margin: 0;
+  font-size: 11px;
+  background: #fff;
+}
+.workspace-lab {
+  margin-top: 30px;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.workspace-lab > summary {
+  padding: 20px 23px;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 550;
+}
+.lab-content {
+  padding: 0 23px 23px;
+}
+.lab-content > .quiet {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.8;
+}
+.benchmark-row {
+  display: flex;
+  gap: 15px;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid var(--line);
+  padding: 12px 0;
+  font-size: 11px;
+}
+.benchmark-row > b {
+  overflow-wrap: anywhere;
+}
+.benchmark-row > span {
+  color: var(--muted);
+}
+.benchmark-row > button {
+  font-size: 10px;
+}
+.benchmark-result {
+  margin-top: 22px;
+}
+.benchmark-score {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 15px;
+}
+.benchmark-score > div {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 20px;
+  display: grid;
+  gap: 8px;
+}
+.benchmark-score strong {
+  font-size: 26px;
+  font-weight: 550;
+}
+.benchmark-score span {
+  font-size: 11px;
+  color: var(--muted);
+}
+.benchmark-counts {
+  font-size: 12px;
+  line-height: 1.9;
+  color: var(--muted);
+  margin-top: 20px;
+}
+.comparison-dialog {
+  width: min(1200px, calc(100vw - 32px));
+}
+.compare-controls,
+.comparison-body {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+}
+.comparison-body > section {
+  min-width: 0;
+}
+.comparison-body h3 {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+  margin: 14px 0;
+}
+.diff-text {
+  font-size: 14px;
+  line-height: 1.9;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 55dvh;
+  overflow: auto;
+  border: 1px solid var(--line);
+  padding: 17px;
+  border-radius: 8px;
+}
+.diff-deleted {
+  background: #ffebe8;
+  color: #7e3c32;
+}
+.diff-added {
+  background: #e1f3e8;
+  color: #25633a;
+}
+@media (max-width: 700px) {
+  .library-toolbar {
+    gap: 9px;
+    margin-top: 15px;
+  }
+  .library-toolbar label {
+    flex: 1;
+    min-width: 90px;
+  }
+  .library-toolbar select,
+  .library-toolbar input {
+    width: 100%;
+  }
+  .library-eta {
+    margin-left: 0;
+    width: 100%;
+    font-size: 10px;
+  }
+  .bulk-toolbar {
+    gap: 7px;
+  }
+  .bulk-toolbar select {
+    width: 145px;
+  }
+  .workspace-dialog {
+    padding: 19px;
+  }
+  .compare-controls,
+  .comparison-body {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+  .benchmark-row {
+    flex-wrap: wrap;
+  }
+  .workspace-field {
+    font-size: 10px;
+  }
+  .workspace-actions button {
+    font-size: 10px;
+  }
+  .upload-profile {
+    margin-bottom: 12px;
+  }
+  .upload-profile select {
+    width: 165px;
+  }
+  .file-select {
+    width: 13px;
+    height: 13px;
+    margin-top: 5px;
+  }
+}
+
+.workspace-error {
+  color: #b7372d;
+  font-size: 12px;
+  line-height: 1.7;
+  margin-top: 16px;
+}

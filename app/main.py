@@ -130,7 +130,7 @@ async def system():
 
 
 @app.post('/api/jobs', status_code=201)
-async def upload(file: UploadFile = File(...), language: str | None = Form(None), segment_seconds: int | None = Form(None), diarize: bool | None = Form(None), output_language: str | None = Form(None), number_style: str | None = Form(None), guidance: str | None = Form(None)):
+async def upload(file: UploadFile = File(...), language: str | None = Form(None), segment_seconds: int | None = Form(None), diarize: bool | None = Form(None), output_language: str | None = Form(None), number_style: str | None = Form(None), guidance: str | None = Form(None), processing_options: str | None = Form(None)):
     defaults = db.get_settings()
     guidance = guidance.strip() if guidance is not None else defaults['guidance']
     number_style = number_style if number_style is not None else defaults['number_style']
@@ -138,6 +138,12 @@ async def upload(file: UploadFile = File(...), language: str | None = Form(None)
     output_language = output_language if output_language is not None else defaults['output_language']
     segment_seconds = segment_seconds if segment_seconds is not None else defaults['segment_seconds']
     diarize = diarize if diarize is not None else defaults['diarize']
+    from workspace_store import validate_settings, snapshot_options, guidance_for
+    try:
+        settings_snapshot=validate_settings({**defaults,**(json.loads(processing_options) if processing_options else {})})
+    except (ValueError,TypeError) as exc:
+        await file.close()
+        raise HTTPException(400,str(exc)) from exc
     original = Path((file.filename or '').replace('\\', '/')).name[:180]
     ext = Path(original).suffix.lower()
     try:
@@ -178,7 +184,7 @@ async def upload(file: UploadFile = File(...), language: str | None = Form(None)
             if diarize and duration>3600:
                 raise HTTPException(400,'File-wide speaker identification supports recordings up to 60 minutes. Turn off Identify speakers for longer recordings.')
             try:
-                await asyncio.to_thread(create_job, id, original, str(dest), language, segment_seconds, diarize, duration, output_language, number_style, guidance, defaults['temperature'], defaults['seed'])
+                await asyncio.to_thread(create_job, id, original, str(dest), language, segment_seconds, diarize, duration, output_language, number_style, guidance_for({**settings_snapshot,'guidance':guidance}), settings_snapshot['temperature'], settings_snapshot['seed'], snapshot_options(settings_snapshot))
             except ValueError as exc:
                 raise HTTPException(429, str(exc)) from exc
             return {'id': id, 'status': 'queued'}
@@ -193,9 +199,9 @@ async def upload(file: UploadFile = File(...), language: str | None = Form(None)
 
 
 @app.get('/api/jobs')
-def jobs(all: bool = False, page: int | None = None, page_size: int = 10, status: str = 'all', sort: str = 'newest'):
+def jobs(all: bool = False, page: int | None = None, page_size: int = 10, status: str = 'all', sort: str = 'newest', project: str | None = None, tag: str | None = None, archive: str = 'active'):
     if page is not None:
-        try:return db.list_jobs_page(page,page_size,status,sort)
+        try:return db.list_jobs_page(page,page_size,status,sort,project,tag,archive)
         except ValueError as exc:raise HTTPException(400,str(exc)) from exc
     return {'jobs': list_jobs(limit=None if all else 100)}
 
@@ -226,6 +232,8 @@ def delete(id: str):
     if path.parent.resolve() == INPUT.resolve():
         path.unlink(missing_ok=True)
     shutil.rmtree(OUTPUT / row['id'], ignore_errors=True)
+    import workspace
+    workspace.cleanup_job(id)
 
 
 @app.get('/api/jobs/{id}/download/{format}')
@@ -274,6 +282,8 @@ def retry(id: str, values: dict | None = None):
     if not values.keys() <= {'use_current_settings'} or not isinstance(values.get('use_current_settings',False),bool):
         raise HTTPException(400,'Use current settings must be a boolean')
     try:
+        from workspace_store import archive_run
+        archive_run(id,OUTPUT)
         row = db.retry_job(id,values.get('use_current_settings',False))
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
@@ -355,9 +365,23 @@ def review_alignment(id: str, values: dict):
         return {'words':[],'matched_words':0,'total_words':len(text.split()),'timestamp_source':None}
     from review import align_review, source_words
     stat = path.stat()
+    from alignment import current_alignment
+    saved=db.get_correction(id)
+    forced=current_alignment(id,text,saved['revision'] if saved else 0)
+    if forced:return forced
     return align_review(text,source_words(str(path),stat.st_mtime_ns,stat.st_size))
 
 
 @app.exception_handler(db.sqlite3.DatabaseError)
 async def database_unavailable(request,exc):
     return JSONResponse({'detail':'The local job database is unavailable. Uploaded media is preserved. Check the data directory or restore a database backup.'},status_code=503)
+
+
+import workspace
+import review_tools
+import alignment
+import exports
+app.include_router(workspace.router)
+app.include_router(review_tools.router)
+app.include_router(alignment.router)
+app.include_router(exports.router)

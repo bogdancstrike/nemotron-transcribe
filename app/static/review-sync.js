@@ -17,6 +17,7 @@
     maxDuration: 0,
     context: null,
     replayEnd: null,
+    loopRange: null,
   };
   function mirrorScroll() {
     layer.scrollTop = editor.scrollTop;
@@ -59,6 +60,11 @@
     editor.classList.add("review-overlay-enabled");
     mirrorScroll();
     tick();
+    document.dispatchEvent(
+      new CustomEvent("review-alignment", {
+        detail: { id: state.job, words: state.words, spans: state.spans },
+      }),
+    );
   }
   async function mapText() {
     if (!state.job) return;
@@ -100,6 +106,13 @@
   function tick() {
     const media = corrections.media;
     if (!media) return;
+    if (
+      state.loopRange &&
+      !media.paused &&
+      media.currentTime >= state.loopRange.end
+    ) {
+      media.currentTime = state.loopRange.start;
+    }
     if (
       state.replayEnd !== null &&
       !media.paused &&
@@ -156,12 +169,68 @@
       state.words.find((w) => w.char_start < position && position <= w.char_end)
     );
   }
+  function selectionInfo() {
+    const start = editor.selectionStart,
+      end = editor.selectionEnd;
+    let words = state.words.filter(
+      (word) => word.char_start < end && word.char_end > start,
+    );
+    const selected = editor.value.slice(start, end);
+    // Unicode lexical tokenization: JavaScript \w is ASCII, so use property escapes.
+    const count = [
+      ...selected.matchAll(
+        /\p{N}+(?:[.,]\p{N}+)*|[\p{L}\p{N}]+(?:['’\-][\p{L}\p{N}]+)*/gu,
+      ),
+    ].length;
+    const selectedRange = start !== end;
+    if (!selectedRange) {
+      const word = atCaret();
+      words = word ? [word] : [];
+    }
+    const complete =
+      words.length > 0 &&
+      (!selectedRange || (count > 0 && words.length >= count));
+    return {
+      jobId: state.job,
+      char_start: selectedRange ? start : (words[0]?.char_start ?? start),
+      char_end: selectedRange ? end : (words[0]?.char_end ?? end),
+      text: selectedRange
+        ? selected
+        : words[0]
+          ? editor.value.slice(words[0].char_start, words[0].char_end)
+          : "",
+      documentText: editor.value,
+      word_count: selectedRange ? count : words.length,
+      selected: selectedRange,
+      words,
+      complete_timing: complete,
+      range: complete
+        ? {
+            start: Math.min(...words.map((word) => word.start)),
+            end: Math.max(...words.map((word) => word.end)),
+          }
+        : null,
+    };
+  }
+  function playRange(range, loop = false) {
+    document.dispatchEvent(new CustomEvent("review-audio-reset"));
+    if (!range || !corrections.media) return;
+    state.loopRange = loop ? { ...range } : null;
+    state.replayEnd = loop ? null : range.end;
+    corrections.media.currentTime = range.start;
+    tick();
+    corrections.media.play().catch(() => {
+      status.textContent = "Press Play on the recording to begin.";
+    });
+  }
   function seek(word, play = false, replay = false) {
+    document.dispatchEvent(new CustomEvent("review-audio-reset"));
     if (!word || !corrections.media) return;
     if (corrections.media.readyState < 1) {
       status.textContent = "The recording is still loading.";
       return;
     }
+    state.loopRange = null;
     corrections.media.currentTime = replay
       ? Math.max(0, word.start - 1.5)
       : word.start;
@@ -176,9 +245,22 @@
   }
   function closeMenu() {
     menu.hidden = true;
+    if (state.context && state.context.selection?.documentText === editor.value)
+      editor.setSelectionRange(state.context.start, state.context.end);
   }
   function openMenu(event) {
     event.preventDefault();
+    // Browser downloads/menus can blur a textarea and collapse an inactive selection on
+    // the next right-click. Preserve that passage until an explicit new left-click/edit.
+    const previous = state.context;
+    if (
+      editor.selectionStart === editor.selectionEnd &&
+      previous?.selection.selected &&
+      previous.selection.documentText === editor.value &&
+      editor.selectionStart >= previous.start &&
+      editor.selectionStart <= previous.end
+    )
+      editor.setSelectionRange(previous.start, previous.end);
     const selected = editor.value.slice(
         editor.selectionStart,
         editor.selectionEnd,
@@ -189,14 +271,29 @@
       selected,
       start: editor.selectionStart,
       end: editor.selectionEnd,
+      selection: selectionInfo(),
     };
-    document.querySelector("#reviewContextPlay").disabled = !word;
-    document.querySelector("#reviewContextReplay").disabled = !word;
+    document.querySelector("#reviewContextPlay").disabled =
+      !state.context.selection.complete_timing;
+    document.querySelector("#reviewContextPlay").textContent = state.context
+      .selection.selected
+      ? "Play selection"
+      : "Play from this word";
+    document.querySelector("#reviewContextReplay").disabled =
+      !state.context.selection.complete_timing;
+    document.querySelector("#reviewContextReplay").textContent = state.context
+      .selection.selected
+      ? "Replay around selection"
+      : "Replay around this word";
     document.querySelector("#reviewContextCopy").disabled = !selected;
     document.querySelector("#reviewContextFind").disabled = !selected;
-    document.querySelector("#reviewContextNote").textContent = word
-      ? "Word timing comes from the original transcript."
-      : "This edited word has no original timing.";
+    document.querySelector("#reviewContextNote").textContent = state.context
+      .selection.complete_timing
+      ? `${state.context.selection.word_count} timed word${state.context.selection.word_count === 1 ? "" : "s"} · real recording boundaries`
+      : "Some selected words have no reliable timing. Text export is still available.";
+    document.dispatchEvent(
+      new CustomEvent("review-context", { detail: state.context.selection }),
+    );
     menu.hidden = false;
     const box = editor.getBoundingClientRect();
     menu.style.left =
@@ -233,8 +330,10 @@
     { passive: true },
   );
   editor.addEventListener("mouseup", (event) => {
-    if (event.button === 0 && editor.selectionStart === editor.selectionEnd)
+    if (event.button === 0 && editor.selectionStart === editor.selectionEnd) {
+      state.context = null;
       seek(atCaret());
+    }
   });
   editor.addEventListener("contextmenu", openMenu);
   editor.addEventListener("keydown", (event) => {
@@ -251,7 +350,9 @@
     }
     if (["ArrowDown", "ArrowUp"].includes(event.key)) {
       event.preventDefault();
-      const items = [...menu.querySelectorAll("button:not(:disabled)")],
+      const items = [
+          ...menu.querySelectorAll("button:not(:disabled), summary"),
+        ].filter((item) => item.offsetParent !== null),
         index = items.indexOf(document.activeElement);
       items[
         (index + (event.key === "ArrowDown" ? 1 : -1) + items.length) %
@@ -260,13 +361,23 @@
     }
   });
   document.querySelector("#reviewContextPlay").addEventListener("click", () => {
-    seek(state.context?.word, true);
+    if (state.context?.selection.selected)
+      playRange(state.context.selection.range);
+    else seek(state.context?.word, true);
     closeMenu();
   });
   document
     .querySelector("#reviewContextReplay")
     .addEventListener("click", () => {
-      seek(state.context?.word, true, true);
+      if (state.context?.selection.selected && state.context.selection.range)
+        playRange({
+          start: Math.max(0, state.context.selection.range.start - 1.5),
+          end: Math.min(
+            corrections.media.duration,
+            state.context.selection.range.end + 2,
+          ),
+        });
+      else seek(state.context?.word, true, true);
       closeMenu();
     });
   document
@@ -295,8 +406,28 @@
     closeMenu();
   });
   window.ReviewSync = {
+    getState() {
+      return {
+        jobId: state.job,
+        words: state.words,
+        spans: state.spans,
+        media: corrections.media,
+      };
+    },
+    getSelection: selectionInfo,
+    refresh: mapText,
+    playSelection(selection, loop = false) {
+      playRange(selection?.range || selection, loop);
+    },
+    stopLoop() {
+      state.loopRange = null;
+      state.replayEnd = null;
+    },
+    closeMenu,
     load(id) {
       state.job = id;
+      state.loopRange = null;
+      state.replayEnd = null;
       state.controller?.abort();
       clearTimeout(state.timer);
       if (state.frame) cancelAnimationFrame(state.frame);
@@ -318,8 +449,12 @@
         });
       }
       mapText();
+      document.dispatchEvent(
+        new CustomEvent("review-loaded", { detail: { id, media } }),
+      );
     },
     changed() {
+      state.context = null;
       state.holdUntil = performance.now() + 5000;
       state.version++;
       state.controller?.abort();

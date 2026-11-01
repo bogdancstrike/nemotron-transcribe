@@ -17,12 +17,12 @@ services:
   worker:
     environment:
       NEMO_MODE: hybrid
-      NEMO_PATCH_COMMIT: caf06be548ad7b19a60ea8e11dd5412ccb7a9f9c
+      NEMO_PATCH_COMMIT: b6be7429c18866dd8acd3c9e74296d791e7f084c
   monitor:
     gpus: all
     environment:
       NEMO_MODE: hybrid
       NEMO_CPU_MOE_LAYERS: ${NEMO_CPU_MOE_LAYERS:-48}
-      NEMO_PATCH_COMMIT: caf06be548ad7b19a60ea8e11dd5412ccb7a9f9c
+      NEMO_PATCH_COMMIT: b6be7429c18866dd8acd3c9e74296d791e7f084c
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: utility

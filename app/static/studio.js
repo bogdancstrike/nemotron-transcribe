@@ -115,6 +115,8 @@ for (const event of ["dragleave", "drop"])
   });
 $("#drop").addEventListener("drop", (e) => selectFiles(e.dataTransfer.files));
 function upload(file, settings, position, total) {
+  if (window.WorkspaceUI)
+    return window.WorkspaceUI.upload(file, settings, position, total);
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest(),
       form = new FormData();
@@ -394,6 +396,8 @@ function renderJobs() {
           processing: "Transcribing",
           done: "Completed",
           failed: "Failed",
+          paused: "Paused",
+          cancelled: "Cancelled",
         }[job.status],
       ),
     );
@@ -556,6 +560,7 @@ function renderJobs() {
       card.append(details);
     }
     holder.append(card);
+    if (window.WorkspaceUI) window.WorkspaceUI.decorateFile(card, job);
   }
   return true;
 }
@@ -702,7 +707,7 @@ async function refresh() {
   try {
     const [files, stats, statisticsPage] = await Promise.all([
       api(
-        `/api/jobs?page=${ui.filePage || 1}&page_size=${ui.filePageSize || 10}&status=${ui.fileStatus || "all"}&sort=${$("#fileSort").value}`,
+        `/api/jobs?page=${ui.filePage || 1}&page_size=${ui.filePageSize || 10}&status=${ui.fileStatus || "all"}&sort=${$("#fileSort").value}${window.WorkspaceUI ? window.WorkspaceUI.filterQuery() : ""}`,
       ),
       api("/api/stats"),
       api(
@@ -726,6 +731,7 @@ async function refresh() {
     ui.fileResponse = files;
     ui.filePage = files.page;
     ui.jobs = files.jobs;
+    if (window.WorkspaceUI) window.WorkspaceUI.updateQueue();
     ui.statsResponse = statisticsPage;
     ui.statsPage = statisticsPage.page;
     if (ui.reviewDoneCount !== stats.counts.done) {
@@ -1027,7 +1033,8 @@ function renderSyncedTranscript(result, preserveFilter = false) {
       "option",
       "",
       result.speaker_scope === "file"
-        ? `Speaker ${group.speaker}`
+        ? result.speaker_names?.[String(group.speaker)] ||
+            `Speaker ${group.speaker}`
         : `Segment ${group.index + 1} · Speaker ${group.speaker}`,
     );
     option.value = key;
@@ -1059,7 +1066,8 @@ function renderSyncedTranscript(result, preserveFilter = false) {
           "span",
           "speaker-label",
           result.speaker_scope === "file"
-            ? `Speaker ${group.speaker}`
+            ? result.speaker_names?.[String(group.speaker)] ||
+                `Speaker ${group.speaker}`
             : `Segment ${group.index + 1} · Speaker ${group.speaker}`,
         ),
       );
@@ -1257,6 +1265,7 @@ async function showPlayer(job, navigate = true) {
   try {
     const result = await api(endpoint(job.id, "json"));
     if (request !== playback.request) return;
+    if (window.ReviewTools) await window.ReviewTools.prepareResult(result);
     renderSyncedTranscript(result);
     const video = ["mp4", "webm", "mkv", "mov", "avi"].includes(
         job.filename.split(".").pop().toLowerCase(),
@@ -1267,34 +1276,11 @@ async function showPlayer(job, navigate = true) {
     media.src = `/api/jobs/${encodeURIComponent(job.id)}/media`;
     media.setAttribute("aria-label", job.filename);
     media.playsInline = true;
-    if (!video) {
-      const cover = node("div", "audio-cover");
-      cover.setAttribute("aria-hidden", "true");
-      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-      svg.setAttribute("viewBox", "0 0 64 64");
-      svg.setAttribute("fill", "none");
-      svg.setAttribute("stroke", "currentColor");
-      for (const [x, y] of [
-        [10, 25],
-        [18, 16],
-        [26, 8],
-        [34, 20],
-        [42, 12],
-        [50, 23],
-      ]) {
-        const line = document.createElementNS(
-          "http://www.w3.org/2000/svg",
-          "path",
-        );
-        line.setAttribute("d", `M${x} ${y}V${64 - y}`);
-        line.setAttribute("stroke-linecap", "round");
-        svg.append(line);
-      }
-      cover.append(svg);
-      $("#mediaMount").append(cover);
-    }
     $("#mediaMount").append(media);
     playback.media = media;
+    window.dispatchEvent(
+      new CustomEvent("player-loaded", { detail: { id: job.id, media } }),
+    );
     media.playbackRate = Number($("#playbackSpeed").value);
     for (const event of [
       "timeupdate",
@@ -1483,6 +1469,7 @@ async function loadSettings() {
     $("#uploadGuidance").value = s.guidance || "";
     renderGuidanceExamples(response.guidance_examples || []);
     updateGuidanceCount();
+    if (window.WorkspaceUI) window.WorkspaceUI.hydrateSettings(s);
     $("#modelTemperature").value = s.temperature ?? 0;
     $("#modelSeed").value = s.seed ?? "";
     $("#diarize").checked = s.diarize;
@@ -1529,6 +1516,16 @@ $("#settingsForm").addEventListener("submit", async (e) => {
     seed: $("#modelSeed").value === "" ? null : Number($("#modelSeed").value),
     output_language: $("#defaultOutputLanguage").value,
     diarize: $("#defaultDiarize").checked,
+    ...(window.WorkspaceUI
+      ? {
+          chunk_mode: $("#chunkMode").value,
+          overlap_seconds: Number($("#chunkOverlap").value),
+          channel_mode: $("#channelMode").value,
+          vocabulary_ids: [...$("#activeVocabulary").selectedOptions].map(
+            (o) => o.value,
+          ),
+        }
+      : {}),
   };
   try {
     await api("/api/settings", {
@@ -1764,6 +1761,9 @@ async function showCorrections(id, navigate = true) {
     media.setAttribute("aria-label", job.filename);
     $("#correctionMediaMount").replaceChildren(media);
     corrections.media = media;
+    window.dispatchEvent(
+      new CustomEvent("review-loaded", { detail: { id, media } }),
+    );
     if (window.ReviewSync) window.ReviewSync.load(id);
     media.addEventListener("error", () => {
       $("#correctionStatus").textContent =
@@ -1896,9 +1896,15 @@ $("#fileSort").addEventListener("change", () => {
 });
 if (location.pathname === "/files") {
   const params = new URLSearchParams(location.search);
-  ui.fileStatus = ["all", "queued", "processing", "done", "failed"].includes(
-    params.get("status"),
-  )
+  ui.fileStatus = [
+    "all",
+    "queued",
+    "processing",
+    "done",
+    "failed",
+    "paused",
+    "cancelled",
+  ].includes(params.get("status"))
     ? params.get("status")
     : "all";
   if (["newest", "oldest", "status", "name"].includes(params.get("sort")))
